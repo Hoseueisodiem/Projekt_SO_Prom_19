@@ -1,0 +1,16 @@
+# Visual Studio
+.vs/
+
+# Build outputs
+*.exe
+*.out
+*.o
+prom
+
+# Logs
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
