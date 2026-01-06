@@ -8,8 +8,6 @@
 #include "captain_ferry.h"
 
 int main() {
-    setbuf(stdout, NULL);
-
     pid_t pid;
 
     pid = fork();
