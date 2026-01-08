@@ -1,12 +1,28 @@
 #include <unistd.h>
 #include <sys/msg.h>
 #include <sys/ipc.h>
+#include <sys/sem.h>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 
 #include "passenger.h"
 #include "ipc.h"
+
+#define NUM_STATIONS 3
+
+//semafory
+void sem_down(int semid, int semnum) {
+    struct sembuf sb = {
+        static_cast<unsigned short>(semnum), -1, 0};
+    semop(semid, &sb, 1);
+}
+
+void sem_up(int semid, int semnum) {
+    struct sembuf sb = {
+        static_cast<unsigned short>(semnum), 1, 0};
+    semop(semid, &sb, 1);
+}
 
 void run_passenger(int id) {
     key_t key = ftok(".", 'P');
@@ -38,9 +54,31 @@ void run_passenger(int id) {
            MSG_TYPE_DECISION,
            0);
 
-    if (decision.accepted) {
-        dprintf(STDOUT_FILENO, "[PASSENGER] id=%d ACCEPTED\n", id);
-    } else {
+    if (!decision.accepted) {
         dprintf(STDOUT_FILENO, "[PASSENGER] id=%d REJECTED (baggage too heavy)\n", id);
+        return;
     }
+
+    dprintf(STDOUT_FILENO, "[PASSENGER] id=%d ACCEPTED\n", id);
+
+    //kontrola bezp
+    key_t sem_key = ftok(".", 'S');
+    int semid = semget(sem_key, NUM_STATIONS, 0666);
+
+    int station = rand() % NUM_STATIONS;
+
+    sem_down(semid, station);
+
+    dprintf(STDOUT_FILENO,
+            "[PASSENGER] id=%d ENTER security station %d\n",
+            id, station);
+
+    sleep(2); // symulacja kontroli
+
+    dprintf(STDOUT_FILENO,
+            "[PASSENGER] id=%d LEAVE security station %d\n",
+            id, station);
+
+    sem_up(semid, station);
+
 }

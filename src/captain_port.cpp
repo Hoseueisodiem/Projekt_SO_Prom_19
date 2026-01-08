@@ -2,10 +2,13 @@
 #include <unistd.h>
 #include <sys/msg.h>
 #include <sys/ipc.h>
+#include <sys/sem.h>
 #include "captain_port.h"
 #include "ipc.h"
 
 #define MAX_BAGGAGE 20 // max dop waga kg
+#define NUM_STATIONS 3
+#define MAX_PER_STATION 2
 
 void run_captain_port() {
     key_t key = ftok(".", 'P');
@@ -13,6 +16,20 @@ void run_captain_port() {
     if (msgid == -1) {
         dprintf(STDERR_FILENO, "[CAPTAIN PORT] failed to create message queue\n");
         _exit(1);
+    }
+
+
+    //semafory kont bezp
+    key_t sem_key = ftok(".", 'S');
+    int semid = semget(sem_key, NUM_STATIONS, IPC_CREAT | 0666);
+    if (semid == -1) {
+        dprintf(STDERR_FILENO, "[CAPTAIN PORT] failed to create semaphores\n");
+        _exit(1);
+    }
+
+    //max 2 na stanowisko
+    for (int i = 0; i < NUM_STATIONS; i++){
+        semctl(semid, i, SETVAL, MAX_PER_STATION);
     }
 
     dprintf(STDOUT_FILENO, "[CAPTAIN PORT] PID=%d waiting for passengers...\n", getpid());
