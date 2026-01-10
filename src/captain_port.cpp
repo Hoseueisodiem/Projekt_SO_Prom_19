@@ -3,12 +3,12 @@
 #include <sys/msg.h>
 #include <sys/ipc.h>
 #include <sys/sem.h>
+#include <sys/shm.h>
 #include "captain_port.h"
 #include "ipc.h"
+#include "security.h"
 
 #define MAX_BAGGAGE 20 // max dop waga kg
-#define NUM_STATIONS 3
-#define MAX_PER_STATION 2
 
 void run_captain_port() {
     key_t key = ftok(".", 'P');
@@ -18,19 +18,26 @@ void run_captain_port() {
         _exit(1);
     }
 
-
-    //semafory kont bezp
-    key_t sem_key = ftok(".", 'S');
-    int semid = semget(sem_key, NUM_STATIONS, IPC_CREAT | 0666);
-    if (semid == -1) {
-        dprintf(STDERR_FILENO, "[CAPTAIN PORT] failed to create semaphores\n");
+    // pamiec wspoldzielona stan stanowisk
+    key_t shm_key = ftok(".", 'M');
+    int shmid = shmget(shm_key,
+                      sizeof(SecurityStation) * NUM_STATIONS, IPC_CREAT | 0666);
+    if (shmid == -1) {
+        dprintf(STDERR_FILENO, "[CAPTAIN PORT] failed to create shared memory\n");
         _exit(1);
     }
 
-    //max 2 na stanowisko
-    for (int i = 0; i < NUM_STATIONS; i++){
-        semctl(semid, i, SETVAL, MAX_PER_STATION);
+    SecurityStation* stations = (SecurityStation*) shmat(shmid, nullptr, 0);
+
+    for (int i = 0; i < NUM_STATIONS; i++) {
+        stations[i].count = 0;
+        stations[i].gender = -1; // brak
     }
+
+    // mutex do ochrony stanu
+    key_t mutex_key = ftok(".", 'X');
+    int mutex = semget(mutex_key, 1, IPC_CREAT | 0666);
+    semctl(mutex, 0, SETVAL, 1);
 
     dprintf(STDOUT_FILENO, "[CAPTAIN PORT] PID=%d waiting for passengers...\n", getpid());
 

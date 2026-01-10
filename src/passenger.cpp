@@ -2,14 +2,14 @@
 #include <sys/msg.h>
 #include <sys/ipc.h>
 #include <sys/sem.h>
+#include <sys/shm.h>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 
 #include "passenger.h"
 #include "ipc.h"
-
-#define NUM_STATIONS 3
+#include "security.h"
 
 //semafory
 void sem_down(int semid, int semnum) {
@@ -27,13 +27,15 @@ void sem_up(int semid, int semnum) {
 void run_passenger(int id) {
     key_t key = ftok(".", 'P');
     int msgid = msgget(key, 0666);
-    if (msgid == -1) {
-        dprintf(STDERR_FILENO, "[PASSENGER] id=%d failed to get message queue\n", id);
-        _exit(1);
-    }
+    if (msgid == -1)  _exit(1);
 
     srand(getpid());
     int baggage = rand() % 40 + 1; //1-40kg
+    int gender  = rand() % 2;      // male/female
+
+    dprintf(STDOUT_FILENO,
+        "[PASSENGER] id=%d gender=%s\n",
+        id, gender == MALE ? "MALE" : "FEMALE");
 
     PassengerMessage msg;
     msg.mtype = MSG_TYPE_PASSENGER;
@@ -50,9 +52,7 @@ void run_passenger(int id) {
     DecisionMessage decision;
     msgrcv(msgid,
            &decision,
-           sizeof(DecisionMessage) - sizeof(long),
-           MSG_TYPE_DECISION,
-           0);
+           sizeof(DecisionMessage) - sizeof(long), MSG_TYPE_DECISION, 0);
 
     if (!decision.accepted) {
         dprintf(STDOUT_FILENO, "[PASSENGER] id=%d REJECTED (baggage too heavy)\n", id);
@@ -62,12 +62,33 @@ void run_passenger(int id) {
     dprintf(STDOUT_FILENO, "[PASSENGER] id=%d ACCEPTED\n", id);
 
     //kontrola bezp
-    key_t sem_key = ftok(".", 'S');
-    int semid = semget(sem_key, NUM_STATIONS, 0666);
+    key_t shm_key = ftok(".", 'M');
+    int shmid = shmget(shm_key, sizeof(SecurityStation) * NUM_STATIONS, 0666);
+    SecurityStation* stations = (SecurityStation*) shmat(shmid, nullptr, 0);
+
+    key_t mutex_key = ftok(".", 'X');
+    int mutex = semget(mutex_key, 1, 0666);
 
     int station = rand() % NUM_STATIONS;
 
-    sem_down(semid, station);
+    //proba wejscia
+    while (true) {
+        sem_down(mutex, 0);
+
+        if (stations[station].count == 0) {
+            stations[station].gender = gender;
+        }
+
+        if (stations[station].gender == gender &&
+            stations[station].count < 2) {
+            stations[station].count++;
+            sem_up(mutex, 0);
+            break;
+        }
+
+        sem_up(mutex, 0);
+        sleep(1);
+    }
 
     dprintf(STDOUT_FILENO,
             "[PASSENGER] id=%d ENTER security station %d\n",
@@ -79,6 +100,13 @@ void run_passenger(int id) {
             "[PASSENGER] id=%d LEAVE security station %d\n",
             id, station);
 
-    sem_up(semid, station);
+    //wyjscie
+    sem_down(mutex, 0);
 
+    stations[station].count--;
+    if (stations[station].count == 0) {
+        stations[station].gender = -1;
+    }
+
+    sem_up(mutex, 0);
 }
