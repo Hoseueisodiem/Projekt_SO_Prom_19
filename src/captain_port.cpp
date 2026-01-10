@@ -39,6 +39,17 @@ void run_captain_port() {
     int mutex = semget(mutex_key, 1, IPC_CREAT | 0666);
     semctl(mutex, 0, SETVAL, 1);
 
+    // trap K
+    key_t trap_key = ftok(".", 'T');
+    int trap_sem = semget(trap_key, 1, IPC_CREAT | 0666);
+    semctl(trap_sem, 0, SETVAL, GANGWAY_CAPACITY);
+
+    // prom P
+    key_t ferry_key = ftok(".", 'F');
+    int ferry_shmid = shmget(ferry_key, sizeof(FerryState), IPC_CREAT | 0666);
+    FerryState* ferry = (FerryState*) shmat(ferry_shmid, nullptr, 0);
+    ferry->onboard = 0;
+
     dprintf(STDOUT_FILENO, "[CAPTAIN PORT] PID=%d waiting for passengers...\n", getpid());
 
     PassengerMessage msg;

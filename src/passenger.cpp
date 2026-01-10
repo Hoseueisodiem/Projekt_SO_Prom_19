@@ -61,7 +61,7 @@ void run_passenger(int id) {
 
     dprintf(STDOUT_FILENO, "[PASSENGER] id=%d ACCEPTED\n", id);
 
-    //kontrola bezp
+/*=== kontrola bezp ===*/
     key_t shm_key = ftok(".", 'M');
     int shmid = shmget(shm_key, sizeof(SecurityStation) * NUM_STATIONS, 0666);
     SecurityStation* stations = (SecurityStation*) shmat(shmid, nullptr, 0);
@@ -109,4 +109,24 @@ void run_passenger(int id) {
     }
 
     sem_up(mutex, 0);
+
+/*=== poczekalnia -> trap -> prom ===*/
+    // trap
+    key_t trap_key = ftok(".", 'T');
+    int trap_sem = semget(trap_key, 1, 0666);
+    sem_down(trap_sem, 0);
+
+    // prom
+    key_t ferry_key = ftok(".", 'F');
+    int ferry_shmid = shmget(ferry_key, sizeof(FerryState), 0666);
+    FerryState* ferry = (FerryState*) shmat(ferry_shmid, nullptr, 0);
+
+    sem_down(mutex, 0);
+    if (ferry->onboard < FERRY_CAPACITY) {
+        ferry->onboard++;
+        dprintf(STDOUT_FILENO, "[PASSENGER] id=%d BOARDED ferry (%d/%d)\n", id, ferry->onboard, FERRY_CAPACITY);
+    }
+    sem_up(mutex, 0);
+
+    sem_up(trap_sem, 0);
 }
