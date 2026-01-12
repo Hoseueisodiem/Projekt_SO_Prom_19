@@ -12,13 +12,13 @@
 #include "security.h"
 
 //semafory
-void sem_down(int semid, int semnum) {
+static void sem_down(int semid, int semnum) {
     struct sembuf sb = {
         static_cast<unsigned short>(semnum), -1, 0};
     semop(semid, &sb, 1);
 }
 
-void sem_up(int semid, int semnum) {
+static void sem_up(int semid, int semnum) {
     struct sembuf sb = {
         static_cast<unsigned short>(semnum), 1, 0};
     semop(semid, &sb, 1);
