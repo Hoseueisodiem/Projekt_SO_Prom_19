@@ -32,10 +32,14 @@ void run_passenger(int id) {
     srand(getpid());
     int baggage = rand() % 40 + 1; //1-40kg
     int gender  = rand() % 2;      // male/female
+    bool vip    = (rand() % 5 == 0); // ok 20% vip
+    int waited  = 0;               // frustracja
 
     dprintf(STDOUT_FILENO,
-        "[PASSENGER] id=%d gender=%s\n",
-        id, gender == MALE ? "MALE" : "FEMALE");
+            "[PASSENGER] id=%d %s gender=%s\n",
+            id,
+            vip ? "VIP" : "REGULAR",
+            gender == MALE ? "MALE" : "FEMALE");
 
     PassengerMessage msg;
     msg.mtype = MSG_TYPE_PASSENGER;
@@ -87,6 +91,14 @@ void run_passenger(int id) {
         }
 
         sem_up(mutex, 0);
+
+        if (!vip) {
+            waited++;
+            if (waited > 3) {
+                dprintf(STDOUT_FILENO, "[PASSENGER] id=%d FRUSTRATED, leaving security queue\n", id);
+                return;
+            }
+        }
         sleep(1);
     }
 
@@ -110,11 +122,25 @@ void run_passenger(int id) {
 
     sem_up(mutex, 0);
 
-/*=== poczekalnia -> trap -> prom ===*/
+/*=== poczekalnia -> trap -> prom + frustracja ===*/
     // trap
     key_t trap_key = ftok(".", 'T');
     int trap_sem = semget(trap_key, 1, 0666);
-    sem_down(trap_sem, 0);
+
+    struct sembuf sb = {0, -1, IPC_NOWAIT};
+
+    while (semop(trap_sem, &sb, 1) == -1) {
+        if (!vip) {
+            waited++;
+            if (waited > 3) {
+                dprintf(STDOUT_FILENO,
+                        "[PASSENGER] id=%d FRUSTRATED, leaving gangway queue\n",
+                        id);
+                return;
+            }
+        }
+        sleep(1);
+    }
 
     // prom
     key_t ferry_key = ftok(".", 'F');
