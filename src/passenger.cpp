@@ -25,7 +25,7 @@ static void sem_up(int semid, int semnum) {
 }
 
 void run_passenger(int id) {
-    key_t key = ftok(".", 'P');
+    key_t key = ftok("/tmp", 'P');
     int msgid = msgget(key, 0666);
     if (msgid == -1)  _exit(1);
 
@@ -66,11 +66,16 @@ void run_passenger(int id) {
     dprintf(STDOUT_FILENO, "[PASSENGER] id=%d ACCEPTED\n", id);
 
 /*=== kontrola bezp ===*/
-    key_t shm_key = ftok(".", 'M');
+    key_t shm_key = ftok("/tmp", 'M');
     int shmid = shmget(shm_key, sizeof(SecurityStation) * NUM_STATIONS, 0666);
     SecurityStation* stations = (SecurityStation*) shmat(shmid, nullptr, 0);
 
-    key_t mutex_key = ftok(".", 'X');
+    if (stations == (void*) -1) {
+    perror("shmat stations");
+    _exit(1);
+    }
+
+    key_t mutex_key = ftok("/tmp", 'X');
     int mutex = semget(mutex_key, 1, 0666);
 
     int station = rand() % NUM_STATIONS;
@@ -124,7 +129,7 @@ void run_passenger(int id) {
 
 /*=== poczekalnia -> trap -> prom + frustracja ===*/
     // trap
-    key_t trap_key = ftok(".", 'T');
+    key_t trap_key = ftok("/tmp", 'T');
     int trap_sem = semget(trap_key, 1, 0666);
 
     struct sembuf sb = {0, -1, IPC_NOWAIT};
@@ -143,9 +148,14 @@ void run_passenger(int id) {
     }
 
     // prom
-    key_t ferry_key = ftok(".", 'F');
+    key_t ferry_key = ftok("/tmp", 'F');
     int ferry_shmid = shmget(ferry_key, sizeof(FerryState), 0666);
     FerryState* ferry = (FerryState*) shmat(ferry_shmid, nullptr, 0);
+
+    if (ferry == (void*) -1) {
+    perror("shmat ferry");
+    _exit(1);
+    }
 
     sem_down(mutex, 0);
     if (ferry->onboard < FERRY_CAPACITY) {
