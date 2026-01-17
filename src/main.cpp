@@ -21,6 +21,7 @@ int main() {
         run_captain_port();
         _exit(0);
     }
+    sleep(1);
 
     pid = fork();
     if (pid == 0) {
@@ -29,12 +30,15 @@ int main() {
     }
     ferry_pid = pid;
 
+    sleep(1);
+
     for (int i = 0; i < 3; i++) {
         pid = fork();
         if (pid == 0) {
             run_passenger(i);
             _exit(0);
         }
+        usleep(200000); //odstep miedzy pasazerami
     }
 
     while (wait(nullptr) > 0);

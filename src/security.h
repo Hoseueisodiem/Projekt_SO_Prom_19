@@ -16,4 +16,5 @@ struct SecurityStation {
 };
 struct FerryState {
     int onboard;  // ilu pasazerow jest na promie
+    int in_waiting; // ilu czeka w poczekalni po kontroli, przed promem
 };

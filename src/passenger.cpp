@@ -55,8 +55,10 @@ void run_passenger(int id) {
 
     DecisionMessage decision;
     msgrcv(msgid,
-           &decision,
-           sizeof(DecisionMessage) - sizeof(long), MSG_TYPE_DECISION, 0);
+            &decision,
+            sizeof(DecisionMessage) - sizeof(long),
+            MSG_TYPE_DECISION_BASE + id,
+            0);
 
     if (!decision.accepted) {
         dprintf(STDOUT_FILENO, "[PASSENGER] id=%d REJECTED (baggage too heavy)\n", id);
@@ -119,13 +121,50 @@ void run_passenger(int id) {
 
     //wyjscie
     sem_down(mutex, 0);
-
     stations[station].count--;
     if (stations[station].count == 0) {
         stations[station].gender = -1;
     }
-
     sem_up(mutex, 0);
+
+    key_t ferry_key = ftok("/tmp", 'F');
+    if (ferry_key == -1) {
+        perror("[PASSENGER] ftok ferry_key");
+        _exit(1);
+    }
+    
+    int ferry_shmid = -1;
+    // retry przez max 5s
+    for (int attempt = 0; attempt < 50; attempt++) {
+        ferry_shmid = shmget(ferry_key, sizeof(FerryState), 0666);
+        if (ferry_shmid != -1) {
+            break;
+        }
+        usleep(100000);
+    }
+    
+    if (ferry_shmid == -1) {
+        dprintf(STDERR_FILENO, "[PASSENGER %d] shmget ferry failed after retries\n", id);
+        perror("[PASSENGER] shmget ferry");
+        _exit(1);
+    }
+    
+    FerryState* ferry = (FerryState*) shmat(ferry_shmid, nullptr, 0);
+
+    if (ferry == (void*) -1) {
+        dprintf(STDERR_FILENO, "[PASSENGER %d] shmat ferry failed, shmid=%d\n", id, ferry_shmid);
+        perror("[PASSENGER] shmat ferry");
+        _exit(1);
+    }
+
+    sem_down(mutex, 0);
+    ferry->in_waiting++;
+    int current_waiting = ferry->in_waiting;
+    sem_up(mutex, 0);
+    
+    dprintf(STDOUT_FILENO, 
+            "[PASSENGER] id=%d ENTERED waiting area (%d waiting)\n",
+            id, current_waiting);
 
 /*=== poczekalnia -> trap -> prom + frustracja ===*/
     // trap
@@ -141,26 +180,23 @@ void run_passenger(int id) {
                 dprintf(STDOUT_FILENO,
                         "[PASSENGER] id=%d FRUSTRATED, leaving gangway queue\n",
                         id);
+                sem_down(mutex, 0);
+                ferry->in_waiting--;
+                sem_up(mutex, 0);
+                
                 return;
             }
         }
         sleep(1);
     }
 
-    // prom
-    key_t ferry_key = ftok("/tmp", 'F');
-    int ferry_shmid = shmget(ferry_key, sizeof(FerryState), 0666);
-    FerryState* ferry = (FerryState*) shmat(ferry_shmid, nullptr, 0);
-
-    if (ferry == (void*) -1) {
-    perror("shmat ferry");
-    _exit(1);
-    }
-
     sem_down(mutex, 0);
+    ferry->in_waiting--;     // wychodzi z poczekalni
+    
     if (ferry->onboard < FERRY_CAPACITY) {
-        ferry->onboard++;
-        dprintf(STDOUT_FILENO, "[PASSENGER] id=%d BOARDED ferry (%d/%d)\n", id, ferry->onboard, FERRY_CAPACITY);
+        ferry->onboard++;    // wchodzi na prom
+        dprintf(STDOUT_FILENO, "[PASSENGER] id=%d BOARDED ferry (%d waiting, %d/%d onboard)\n", 
+                id, ferry->in_waiting, ferry->onboard, FERRY_CAPACITY);
     }
     sem_up(mutex, 0);
 
