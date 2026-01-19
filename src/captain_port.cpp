@@ -10,7 +10,6 @@
 #include "security.h"
 
 #define MAX_BAGGAGE 20 // max dop waga kg
-extern pid_t ferry_pid;
 
 static void sem_down(int semid, int semnum) {
     struct sembuf sb = {
@@ -22,6 +21,11 @@ static void sem_up(int semid, int semnum) {
     struct sembuf sb = {
         static_cast<unsigned short>(semnum), 1, 0};
     semop(semid, &sb, 1);
+}
+volatile sig_atomic_t port_closed = 0;
+
+static void handle_sigusr2(int) {
+    port_closed = 1;
 }
 
 static void cleanup_ipc() {
@@ -74,9 +78,19 @@ static void cleanup_ipc() {
             dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Removed old trap semaphore\n");
         }
     }
+
+    key_t port_state_key = ftok("/tmp", 'S');
+    if (port_state_key != -1) {
+        int shmid = shmget(port_state_key, 0, 0);
+        if (shmid != -1) {
+            shmctl(shmid, IPC_RMID, nullptr);
+            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Removed old port state shared memory\n");
+        }
+    }
 }
 
 void run_captain_port() {
+    signal(SIGUSR2, handle_sigusr2);
     cleanup_ipc();
 
     key_t key = ftok("/tmp", 'P');
@@ -130,6 +144,23 @@ void run_captain_port() {
     ferry->onboard = 0;
     ferry->in_waiting = 0;
 
+    key_t port_state_key = ftok("/tmp", 'S');
+    int port_shmid = shmget(port_state_key, sizeof(PortState), IPC_CREAT | 0666);
+    if (port_shmid == -1) {
+        perror("[CAPTAIN PORT] shmget port_state");
+        _exit(1);
+    }
+    
+    PortState* port_state = (PortState*) shmat(port_shmid, nullptr, 0);
+    if (port_state == (void*) -1) {
+        perror("[CAPTAIN PORT] shmat port_state");
+        _exit(1);
+    }
+    
+    port_state->accepting_passengers = 1;  // port otwarty
+    port_state->passengers_onboard = 0;
+    port_state->ferry_captain_pid = -1;  // jeszcze nie znany
+
     dprintf(STDOUT_FILENO, "[CAPTAIN PORT] PID=%d waiting for passengers...\n", getpid());
 
     int accepted_count = 0;
@@ -137,58 +168,37 @@ void run_captain_port() {
     bool signal_sent_for_current_ferry = false;
 
     while (true) {
-        // sprawdzenie czy prom odplynal
-        FerryDepartureMessage departure_msg;
-        if (msgrcv(msgid, &departure_msg, 
-                   sizeof(FerryDepartureMessage) - sizeof(long),
-                   MSG_TYPE_FERRY_DEPARTED, IPC_NOWAIT) != -1) {
-            
-            dprintf(STDOUT_FILENO, 
-                "[CAPTAIN PORT] Ferry departed with %d passengers. Ready for next ferry.\n",
-                departure_msg.passengers_count);
-            
-            current_ferry_passengers = 0;
-            signal_sent_for_current_ferry = false;
-        }
-        
-        // sprawdzenie czy jest pasazer
-        PassengerMessage msg;
-        if (msgrcv(msgid, &msg, 
-                   sizeof(PassengerMessage) - sizeof(long), 
-                   MSG_TYPE_PASSENGER, IPC_NOWAIT) == -1) {
-            
-            // sprawdz czy wyslac sygnal na pods poczekalni
-            if (!signal_sent_for_current_ferry) {
-                sem_down(mutex, 0);
-                int in_waiting = ferry->in_waiting;
-                int onboard = ferry->onboard;
-                int total_ready = in_waiting + onboard;
-                sem_up(mutex, 0);
-                
-                if (total_ready >= FERRY_CAPACITY / 2) {
-                    dprintf(STDOUT_FILENO,
-                        "[CAPTAIN PORT] Half capacity reached (%d waiting + %d onboard = %d/%d), sending EARLY DEPARTURE signal to PID=%d\n",
-                        in_waiting, onboard, total_ready, FERRY_CAPACITY, ferry_pid);
 
-                    if (ferry_pid > 1 && ferry_pid != getpid()) {
-                        if (kill(ferry_pid, SIGUSR1) == -1) {
-                            perror("[CAPTAIN PORT] kill SIGUSR1 failed");
-                        } else {
-                            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] SIGUSR1 sent successfully\n");
-                            signal_sent_for_current_ferry = true;
-                        }
-                    } else {
-                        dprintf(STDERR_FILENO,
-                            "[ERROR] invalid ferry_pid=%d, signal NOT sent\n",
-                            ferry_pid);
-                    }
-                }
+        // sprawdzanie czy port zamkniety
+        if (port_closed) {
+        port_state->accepting_passengers = 0;
+        dprintf(STDOUT_FILENO, "[CAPTAIN PORT] SIGUSR2 received - Port CLOSED. No more passengers allowed.\n");
+            
+        // czekanie az pasazerowie opuszcza promy
+        dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Waiting for all passengers to be delivered...\n");
+        while (true) {
+            sem_down(mutex, 0);
+            int remaining = port_state->passengers_onboard;
+            sem_up(mutex, 0);
+                
+            if (remaining == 0) break;
+                
+            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Still %d passengers onboard, waiting...\n", remaining);
+            sleep(1);
             }
             
-            usleep(100000);
-            continue;
+        dprintf(STDOUT_FILENO, "[CAPTAIN PORT] All passengers delivered. Shutting down.\n");
+        break;
         }
 
+        // pasazerowie
+        PassengerMessage msg;
+        ssize_t msg_result = msgrcv(msgid, &msg, 
+                                     sizeof(PassengerMessage) - sizeof(long), 
+                                     MSG_TYPE_PASSENGER, 
+                                     IPC_NOWAIT);
+    
+        if (msg_result != -1) {
         dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Passenger id=%d baggage=%d kg\n", 
                 msg.passenger_id, msg.baggage_weight);
 
@@ -209,6 +219,59 @@ void run_captain_port() {
                     msg.passenger_id, current_ferry_passengers, FERRY_CAPACITY);
         }
 
-        msgsnd(msgid, &decision, sizeof(DecisionMessage) - sizeof(long), 0);        
+        msgsnd(msgid, &decision, sizeof(DecisionMessage) - sizeof(long), 0);
+        
+        continue;
+        }
+
+        // sprawdzenie czy prom odplynal
+        FerryDepartureMessage departure_msg;
+        if (msgrcv(msgid, &departure_msg, 
+                sizeof(FerryDepartureMessage) - sizeof(long),
+                MSG_TYPE_FERRY_DEPARTED, IPC_NOWAIT) != -1) {
+            
+            dprintf(STDOUT_FILENO, 
+                "[CAPTAIN PORT] Ferry departed with %d passengers. Ready for next ferry.\n",
+                departure_msg.passengers_count);
+            
+            current_ferry_passengers = 0;
+            signal_sent_for_current_ferry = false;
+            continue;
+        }
+        
+        //sigusr1
+        if (!signal_sent_for_current_ferry) {
+            sem_down(mutex, 0);
+            int in_waiting = ferry->in_waiting;
+            int onboard = ferry->onboard;
+            int total_ready = in_waiting + onboard;
+            pid_t ferry_captain_pid = port_state->ferry_captain_pid;
+            sem_up(mutex, 0);
+
+            if (total_ready >= FERRY_CAPACITY / 2) {
+                dprintf(STDOUT_FILENO,
+                    "[CAPTAIN PORT] Half capacity reached (%d waiting + %d onboard = %d/%d), sending EARLY DEPARTURE signal to PID=%d\n",
+                    in_waiting, onboard, total_ready, FERRY_CAPACITY, ferry_captain_pid);
+
+                if (ferry_captain_pid > 1 && ferry_captain_pid != getpid()) {
+                    if (kill(ferry_captain_pid, SIGUSR1) == -1) {
+                        perror("[CAPTAIN PORT] kill SIGUSR1 failed");
+                    } else {
+                        dprintf(STDOUT_FILENO, "[CAPTAIN PORT] SIGUSR1 sent successfully\n");
+                        signal_sent_for_current_ferry = true;
+                    }
+                } else {
+                    dprintf(STDERR_FILENO,
+                    "[CAPTAIN PORT] Ferry captain PID not yet available (pid=%d), waiting...\n",
+                    ferry_captain_pid);
+                    }
+
+                continue;
+            }
+        }
+         usleep(100000);
     }
+    shmdt(port_state);
+    shmdt(ferry);
+    shmdt(stations);
 }
