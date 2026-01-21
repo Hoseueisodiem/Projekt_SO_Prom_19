@@ -96,7 +96,11 @@ void run_passenger(int id) {
         return;
     }
 
-    dprintf(STDOUT_FILENO, "[PASSENGER] id=%d ACCEPTED\n", id);
+    // zapamietaj ID przydzielonego promu
+    int assigned_ferry_id = decision.ferry_id;
+
+    dprintf(STDOUT_FILENO, "[PASSENGER] id=%d ACCEPTED (assigned to ferry %d)\n",
+            id, assigned_ferry_id);
 
 /*=== kontrola bezp ===*/
     key_t shm_key = ftok("/tmp", 'M');
@@ -134,6 +138,8 @@ void run_passenger(int id) {
             waited++;
             if (waited > 3) {
                 dprintf(STDOUT_FILENO, "[PASSENGER] id=%d FRUSTRATED, leaving security queue\n", id);
+                shmdt(port_state);
+                shmdt(stations);
                 return;
             }
         }
@@ -158,44 +164,17 @@ void run_passenger(int id) {
     }
     sem_up(mutex, 0);
 
-    key_t ferry_key = ftok("/tmp", 'F');
-    if (ferry_key == -1) {
-        perror("[PASSENGER] ftok ferry_key");
-        _exit(1);
-    }
-    
-    int ferry_shmid = -1;
-    // retry przez max 5s
-    for (int attempt = 0; attempt < 50; attempt++) {
-        ferry_shmid = shmget(ferry_key, sizeof(FerryState), 0666);
-        if (ferry_shmid != -1) {
-            break;
-        }
-        usleep(100000);
-    }
-    
-    if (ferry_shmid == -1) {
-        dprintf(STDERR_FILENO, "[PASSENGER %d] shmget ferry failed after retries\n", id);
-        perror("[PASSENGER] shmget ferry");
-        _exit(1);
-    }
-    
-    FerryState* ferry = (FerryState*) shmat(ferry_shmid, nullptr, 0);
-
-    if (ferry == (void*) -1) {
-        dprintf(STDERR_FILENO, "[PASSENGER %d] shmat ferry failed, shmid=%d\n", id, ferry_shmid);
-        perror("[PASSENGER] shmat ferry");
-        _exit(1);
-    }
+    // uzyj przydzielonego promu z PortState
+    Ferry* my_ferry = &port_state->ferries[assigned_ferry_id];
 
     sem_down(mutex, 0);
-    ferry->in_waiting++;
-    int current_waiting = ferry->in_waiting;
+    my_ferry->in_waiting++;
+    int current_waiting = my_ferry->in_waiting;
     sem_up(mutex, 0);
-    
-    dprintf(STDOUT_FILENO, 
-            "[PASSENGER] id=%d ENTERED waiting area (%d waiting)\n",
-            id, current_waiting);
+
+    dprintf(STDOUT_FILENO,
+            "[PASSENGER] id=%d ENTERED waiting area for ferry %d (%d waiting)\n",
+            id, assigned_ferry_id, current_waiting);
 
 /*=== poczekalnia -> trap -> prom + frustracja ===*/
     // trap
@@ -204,60 +183,25 @@ void run_passenger(int id) {
 
     while (true) {
         sem_down(mutex, 0);
-        bool ferry_has_space = (ferry->onboard < FERRY_CAPACITY);
-        int current_onboard = ferry->onboard;
+        bool ferry_has_space = (my_ferry->onboard < my_ferry->capacity);
+        int current_onboard = my_ferry->onboard;
         sem_up(mutex, 0);
-    
+
         if (!ferry_has_space) {
             // pelny prom czekaj
-            dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Waiting, ferry full (%d/%d)\n", 
-            id, current_onboard, FERRY_CAPACITY);
-        
-        if (!vip) {
-            waited++;
-            if (waited > 3) {
-                dprintf(STDOUT_FILENO,
-                    "[PASSENGER] id=%d FRUSTRATED, ferry full too long\n", id);
-                sem_down(mutex, 0);
-                ferry->in_waiting--;
-                sem_up(mutex, 0);
+            dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Waiting, ferry %d full (%d/%d)\n",
+                id, assigned_ferry_id, current_onboard, my_ferry->capacity);
 
-                shmdt(port_state);
-                shmdt(ferry);
-                shmdt(stations);
-                return;
-            }
-        }
-        sleep(1);
-        continue;
-    }
-    
-    // prom ma miejsce, wejscie
-    struct sembuf sb = {0, -1, IPC_NOWAIT};
-    if (semop(trap_sem, &sb, 1) != -1) {
-        // sprawdzanie pojemnosci jeszcze raz
-        sem_down(mutex, 0);
-        bool still_has_space = (ferry->onboard < FERRY_CAPACITY);
-        sem_up(mutex, 0);
-        
-        if (still_has_space) {
-            break;
-        } else {
-            // prom zapelnil sie w miedzyczasie - zwolnienie trapu
-            sem_up(trap_sem, 0);
-            dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Ferry became full while on gangway, releasing\n", id);
-            
             if (!vip) {
                 waited++;
                 if (waited > 3) {
                     dprintf(STDOUT_FILENO,
                         "[PASSENGER] id=%d FRUSTRATED, ferry full too long\n", id);
                     sem_down(mutex, 0);
-                    ferry->in_waiting--;
+                    my_ferry->in_waiting--;
                     sem_up(mutex, 0);
 
                     shmdt(port_state);
-                    shmdt(ferry);
                     shmdt(stations);
                     return;
                 }
@@ -265,38 +209,72 @@ void run_passenger(int id) {
             sleep(1);
             continue;
         }
-    }
 
-    if (!vip) {
-        waited++;
-        if (waited > 3) {
-            dprintf(STDOUT_FILENO,
-                "[PASSENGER] id=%d FRUSTRATED, gangway queue too long\n", id);
+        // prom ma miejsce, sprobuj wejsc na trap
+        struct sembuf sb = {0, -1, IPC_NOWAIT};
+        if (semop(trap_sem, &sb, 1) != -1) {
+            // zdobyty trap, ale sprawdz jeszcze raz pojemnosc
             sem_down(mutex, 0);
-            ferry->in_waiting--;
+            bool still_has_space = (my_ferry->onboard < my_ferry->capacity);
             sem_up(mutex, 0);
 
-            shmdt(port_state);
-            shmdt(ferry);
-            shmdt(stations);
-            return;
+            if (still_has_space) {
+                break;
+            } else {
+                // prom zapelnil sie w miedzyczasie
+                sem_up(trap_sem, 0);
+                dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Ferry became full while on gangway, releasing\n", id);
+
+                if (!vip) {
+                    waited++;
+                    if (waited > 3) {
+                        dprintf(STDOUT_FILENO,
+                            "[PASSENGER] id=%d FRUSTRATED, ferry full too long\n", id);
+                        sem_down(mutex, 0);
+                        my_ferry->in_waiting--;
+                        sem_up(mutex, 0);
+
+                        shmdt(port_state);
+                        shmdt(stations);
+                        return;
+                    }
+                }
+                sleep(1);
+                continue;
+            }
         }
+
+        if (!vip) {
+            waited++;
+            if (waited > 3) {
+                dprintf(STDOUT_FILENO,
+                    "[PASSENGER] id=%d FRUSTRATED, gangway queue too long\n", id);
+                sem_down(mutex, 0);
+                my_ferry->in_waiting--;
+                sem_up(mutex, 0);
+
+                shmdt(port_state);
+                shmdt(stations);
+                return;
+            }
+        }
+        sleep(1);
     }
-    sleep(1);
-}
 
     sem_down(mutex, 0);
-    ferry->in_waiting--;     // wychodzi z poczekalni
-    
-    if (ferry->onboard < FERRY_CAPACITY) {
-        ferry->onboard++;    // wchodzi na prom
+    my_ferry->in_waiting--;     // wychodzi z poczekalni
+
+    if (my_ferry->onboard < my_ferry->capacity) {
+        my_ferry->onboard++;    // wchodzi na prom
         port_state->passengers_onboard++;
-        dprintf(STDOUT_FILENO, "[PASSENGER] id=%d BOARDED ferry (%d waiting, %d/%d onboard), %d total)\n", 
-                id, ferry->in_waiting, ferry->onboard, FERRY_CAPACITY, port_state->passengers_onboard);
+        dprintf(STDOUT_FILENO, "[PASSENGER] id=%d BOARDED ferry %d (%d waiting, %d/%d onboard, %d total)\n",
+                id, assigned_ferry_id, my_ferry->in_waiting, my_ferry->onboard,
+                my_ferry->capacity, port_state->passengers_onboard);
     } else {
         // prom zapelnij sie w miedzyczasie
-        ferry->in_waiting++;
-        dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Ferry became full, back to waiting\n", id);
+        my_ferry->in_waiting++;
+        dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Ferry %d became full, back to waiting\n",
+                id, assigned_ferry_id);
     }
     sem_up(mutex, 0);
 
@@ -304,6 +282,5 @@ void run_passenger(int id) {
 
     //cleanup
     shmdt(port_state);
-    shmdt(ferry);
     shmdt(stations);
 }

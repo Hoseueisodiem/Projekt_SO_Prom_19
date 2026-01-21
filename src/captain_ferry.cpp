@@ -32,8 +32,9 @@ static void handle_sigusr1(int) {
 
 // kapitan czeka t1 sekund, sprawdza czy trap psuty, odplywa, reset promu
 
-void run_captain_ferry() {
+void run_captain_ferry(int ferry_id) {
     signal(SIGUSR1, handle_sigusr1);
+
     // mutex
     key_t mutex_key = ftok("/tmp", 'X');
     int mutex = -1;
@@ -60,39 +61,7 @@ void run_captain_ferry() {
         _exit(1);
     }
 
-    // prom
-    key_t ferry_key = ftok("/tmp", 'F');
-    if (ferry_key == -1) {
-        perror("[CAPTAIN FERRY] ftok ferry_key");
-        _exit(1);
-    }
-    
-    int ferry_shmid = -1;
-    // retry przez max 5s
-    for (int attempt = 0; attempt < 50; attempt++) {
-        ferry_shmid = shmget(ferry_key, sizeof(FerryState), 0666);
-        if (ferry_shmid != -1) {
-            break;
-        }
-        usleep(100000);
-    }
-    
-    if (ferry_shmid == -1) {
-        dprintf(STDERR_FILENO, "[CAPTAIN FERRY] shmget failed after retries, key=%d\n", ferry_key);
-        perror("[CAPTAIN FERRY] shmget ferry");
-        _exit(1);
-    }
-    
-    dprintf(STDOUT_FILENO, "[CAPTAIN FERRY] shmget success, shmid=%d\n", ferry_shmid);
-    
-    FerryState* ferry = (FerryState*) shmat(ferry_shmid, nullptr, 0);
-
-    if (ferry == (void*) -1) {
-        dprintf(STDERR_FILENO, "[CAPTAIN FERRY] shmat failed, shmid=%d\n", ferry_shmid);
-        perror("[CAPTAIN FERRY] shmat ferry");
-        _exit(1);
-    }
-
+    // port state
     key_t port_state_key = ftok("/tmp", 'S');
     int port_shmid = -1;
     
@@ -103,7 +72,7 @@ void run_captain_ferry() {
     }
     
     if (port_shmid == -1) {
-        dprintf(STDERR_FILENO, "[CAPTAIN FERRY] shmget port_state failed\n");
+        dprintf(STDERR_FILENO, "[CAPTAIN FERRY %d] shmget port_state failed\n", ferry_id);
         perror("[CAPTAIN FERRY] shmget port_state");
         _exit(1);
     }
@@ -114,10 +83,8 @@ void run_captain_ferry() {
         _exit(1);
     }
 
-    // zapisz swoj PID do pamieci wspoldzielonej
-    sem_down(mutex, 0);
-    port_state->ferry_captain_pid = getpid();
-    sem_up(mutex, 0);
+    // wskaznik na prom
+    Ferry* my_ferry = &port_state->ferries[ferry_id];
 
     // kolejka komunikatow
     key_t msg_key = ftok("/tmp", 'P');
@@ -127,7 +94,13 @@ void run_captain_ferry() {
         _exit(1);
     }
 
-    dprintf(STDOUT_FILENO, "[CAPTAIN FERRY] PID=%d\n", getpid());
+    // zapisz PID kapitana w strukturze promu
+    sem_down(mutex, 0);
+    my_ferry->captain_pid = getpid();
+    sem_up(mutex, 0);
+
+    dprintf(STDOUT_FILENO, "[CAPTAIN FERRY %d] PID=%d, capacity=%d\n",
+            ferry_id, getpid(), my_ferry->capacity);
 
     time_t last_departure = time(nullptr);
     
@@ -150,8 +123,8 @@ void run_captain_ferry() {
             }
             
             if (!trap_clear) {
-                dprintf(STDOUT_FILENO, 
-                    "[CAPTAIN FERRY] Trap still occupied after waiting, skipping departure cycle\n");
+                dprintf(STDOUT_FILENO,
+                    "[CAPTAIN FERRY %d] Trap occupied, skipping departure\n", ferry_id);
                 if (early_departure) {
                     early_departure = 0;
                 }
@@ -163,103 +136,114 @@ void run_captain_ferry() {
             // sprawdz czy sa pasazerowie
             sem_down(mutex, 0);
             int accepting = port_state->accepting_passengers;
-            int onboard = ferry->onboard;
-            int in_waiting = ferry->in_waiting;
+            int onboard = my_ferry->onboard;
+            int in_waiting = my_ferry->in_waiting;
             int passengers_left = port_state->passengers_onboard;
             sem_up(mutex, 0);
 
             // jesli port zamkniety i brak pasazerow koncz
             if (!accepting && passengers_left == 0 && onboard == 0) {
-                dprintf(STDOUT_FILENO, 
-                    "[CAPTAIN FERRY] Port closed, no passengers. Shutting down.\n");
+                dprintf(STDOUT_FILENO,
+                    "[CAPTAIN FERRY %d] Port closed, no passengers. Shutting down.\n", ferry_id);
+
+                sem_down(mutex, 0);
+                my_ferry->status = FERRY_SHUTDOWN;
+                sem_up(mutex, 0);
                 break;
             }
             
             // jesli brak pasazerow na promie
             if (onboard == 0) {
                 if (early_departure) {
-                dprintf(STDOUT_FILENO, 
-                    "[CAPTAIN FERRY] Early departure signal received, but no passengers onboard yet (%d still in waiting). Waiting...\n",
-                    in_waiting);
-                
-                // poczekanie max 5s na pasazerow
-                bool passengers_arrived = false;
-                for (int wait_time = 0; wait_time < 10; wait_time++) {  // 5s
-                    usleep(500000);  // 500ms
-                    
-                    sem_down(mutex, 0);
-                    onboard = ferry->onboard;
-                    sem_up(mutex, 0);
-                    
-                    if (onboard > 0) {
-                        dprintf(STDOUT_FILENO, 
-                            "[CAPTAIN FERRY] Passengers arrived (%d onboard), ready to depart\n", onboard);
-                        passengers_arrived = true;
-                        break;
+                    dprintf(STDOUT_FILENO,
+                        "[CAPTAIN FERRY %d] Early departure signal received, but no passengers onboard yet (%d still in waiting). Waiting...\n",
+                        ferry_id, in_waiting);
+
+                    // poczekanie max 5s na pasazerow
+                    bool passengers_arrived = false;
+                    for (int wait_time = 0; wait_time < 10; wait_time++) {  // 5s
+                        usleep(500000);  // 500ms
+
+                        sem_down(mutex, 0);
+                        onboard = my_ferry->onboard;
+                        sem_up(mutex, 0);
+
+                        if (onboard > 0) {
+                            dprintf(STDOUT_FILENO,
+                                "[CAPTAIN FERRY %d] Passengers arrived (%d onboard), ready to depart\n",
+                                ferry_id, onboard);
+                            passengers_arrived = true;
+                            break;
+                        }
                     }
-                }
-                
-                if (!passengers_arrived) {
-                    dprintf(STDOUT_FILENO, 
-                        "[CAPTAIN FERRY] Still no passengers after waiting. Canceling early departure.\n");
-                    early_departure = 0;
+
+                    if (!passengers_arrived) {
+                        dprintf(STDOUT_FILENO,
+                            "[CAPTAIN FERRY %d] Still no passengers after waiting. Canceling early departure.\n",
+                            ferry_id);
+                        early_departure = 0;
+                        continue;
+                    }
+                } else {
+                    dprintf(STDOUT_FILENO,
+                        "[CAPTAIN FERRY %d] Departure time reached, but no passengers. Skipping departure.\n",
+                        ferry_id);
+                    last_departure = now;
                     continue;
                 }
-            } else {
-                dprintf(STDOUT_FILENO, "[CAPTAIN FERRY] Departure time reached, but no passengers. Skipping departure.\n");
-                last_departure = now;
-                continue;
-            }
             }
 
-            // odplyniecie
+            // ustaw status TRAVELING
             sem_down(mutex, 0);
-            onboard = ferry->onboard;
-            ferry->onboard = 0;
+            onboard = my_ferry->onboard;
+            my_ferry->onboard = 0;
+            my_ferry->status = FERRY_TRAVELING;
             sem_up(mutex, 0);
 
             dprintf(STDOUT_FILENO,
-                "[CAPTAIN FERRY] DEPARTURE%s, onboard=%d\n",
+                "[CAPTAIN FERRY %d] DEPARTURE%s, onboard=%d\n",
+                ferry_id,
                 early_departure ? " (EARLY)" : "",
                 onboard);
 
             early_departure = 0;
             last_departure = now;
-            
-            // wyslanie wiad do kap portu
+
             FerryDepartureMessage departure_msg;
             departure_msg.mtype = MSG_TYPE_FERRY_DEPARTED;
-            departure_msg.ferry_id = 0;
+            departure_msg.ferry_id = ferry_id;
             departure_msg.passengers_count = onboard;
-            
-            if (msgsnd(msgid, &departure_msg, 
+
+            if (msgsnd(msgid, &departure_msg,
                        sizeof(FerryDepartureMessage) - sizeof(long), 0) == -1) {
                 perror("[CAPTAIN FERRY] msgsnd departure message failed");
             } else {
-                dprintf(STDOUT_FILENO, 
-                    "[CAPTAIN FERRY] Sent departure notification to port\n");
+                dprintf(STDOUT_FILENO,
+                    "[CAPTAIN FERRY %d] Sent departure notification to port\n", ferry_id);
             }
 
-            // symulacja podrozu
+            // symulacja podrozy
             if (onboard > 0) {  // tylko jesli sa pasazerowie
-                dprintf(STDOUT_FILENO, 
-                    "[CAPTAIN FERRY] Traveling with %d passengers (estimated %d seconds)...\n",
-                    onboard, TRAVEL_TIME);
-                
+                dprintf(STDOUT_FILENO,
+                    "[CAPTAIN FERRY %d] Traveling with %d passengers (estimated %d seconds)...\n",
+                    ferry_id, onboard, TRAVEL_TIME);
+
                 sleep(TRAVEL_TIME);  // symulacja
-                
-                dprintf(STDOUT_FILENO, 
-                    "[CAPTAIN FERRY] Arrived at destination, passengers disembarking...\n");
-                
+
+                dprintf(STDOUT_FILENO,
+                    "[CAPTAIN FERRY %d] Arrived at destination, passengers disembarking...\n",
+                    ferry_id);
+
                 // zmniejsz passengers_onboard
                 sem_down(mutex, 0);
                 port_state->passengers_onboard -= onboard;
                 int remaining = port_state->passengers_onboard;
+                my_ferry->status = FERRY_AVAILABLE;  // prom znowu dostepny
                 sem_up(mutex, 0);
-                
-                dprintf(STDOUT_FILENO, 
-                    "[CAPTAIN FERRY] Returned to port. %d passengers still onboard (all ferries).\n",
-                    remaining);
+
+                dprintf(STDOUT_FILENO,
+                    "[CAPTAIN FERRY %d] Returned to port. %d passengers still onboard (all ferries).\n",
+                    ferry_id, remaining);
             }
             
             // sprawdzanie warunku zakonczenia
@@ -267,15 +251,19 @@ void run_captain_ferry() {
             accepting = port_state->accepting_passengers;
             passengers_left = port_state->passengers_onboard;
             sem_up(mutex, 0);
-            
+
             if (!accepting && passengers_left == 0) {
                 dprintf(STDOUT_FILENO,
-                    "[CAPTAIN FERRY] Port closed and no passengers remaining. Shutting down.\n");
+                    "[CAPTAIN FERRY %d] Port closed and no passengers remaining. Shutting down.\n",
+                    ferry_id);
+
+                sem_down(mutex, 0);
+                my_ferry->status = FERRY_SHUTDOWN;
+                sem_up(mutex, 0);
                 break;
             }
         }
     }
 
     shmdt(port_state);
-    shmdt(ferry);
 }

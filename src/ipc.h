@@ -16,6 +16,7 @@ struct DecisionMessage {
     long mtype;
     int passenger_id;
     int accepted; // 1 ok, 0 odrzucenie
+    int ferry_id; // id przydzielanego promu (-1 odrzucenie)
 };
 
 struct FerryDepartureMessage {

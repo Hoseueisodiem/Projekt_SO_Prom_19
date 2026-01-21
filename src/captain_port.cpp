@@ -9,8 +9,6 @@
 #include "ipc.h"
 #include "security.h"
 
-#define MAX_BAGGAGE 20 // max dop waga kg
-
 static void sem_down(int semid, int semnum) {
     struct sembuf sb = {
         static_cast<unsigned short>(semnum), -1, 0};
@@ -22,6 +20,7 @@ static void sem_up(int semid, int semnum) {
         static_cast<unsigned short>(semnum), 1, 0};
     semop(semid, &sb, 1);
 }
+
 volatile sig_atomic_t port_closed = 0;
 
 static void handle_sigusr2(int) {
@@ -48,17 +47,7 @@ static void cleanup_ipc() {
             dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Removed old stations shared memory\n");
         }
     }
-    
-    // usun pamięć promu
-    key_t ferry_key = ftok("/tmp", 'F');
-    if (ferry_key != -1) {
-        int shmid = shmget(ferry_key, 0, 0);
-        if (shmid != -1) {
-            shmctl(shmid, IPC_RMID, nullptr);
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Removed old ferry shared memory\n");
-        }
-    }
-    
+
     // usun mutex
     key_t mutex_key = ftok("/tmp", 'X');
     if (mutex_key != -1) {
@@ -79,6 +68,7 @@ static void cleanup_ipc() {
         }
     }
 
+    // usun port state
     key_t port_state_key = ftok("/tmp", 'S');
     if (port_state_key != -1) {
         int shmid = shmget(port_state_key, 0, 0);
@@ -87,6 +77,32 @@ static void cleanup_ipc() {
             dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Removed old port state shared memory\n");
         }
     }
+}
+
+// przydzielenie pasazera do promu
+int assign_passenger_to_ferry(PortState* port_state, int mutex) {
+    sem_down(mutex, 0);
+
+    int selected_ferry = -1;
+
+    // znajdz pierwszy dostepny prom z wolnym miejscem
+    for (int i = 0; i < NUM_FERRIES; i++) {
+        Ferry* ferry = &port_state->ferries[i];
+
+        // prom musi byc dostepny lub w trakcie zaladunku
+        if (ferry->status == FERRY_AVAILABLE || ferry->status == FERRY_BOARDING) {
+            int total = ferry->in_waiting + ferry->onboard;
+
+            if (total < ferry->capacity) {
+                selected_ferry = i;
+                ferry->status = FERRY_BOARDING;  // oznacz ze pasazerowie wsiadaja
+                break;
+            }
+        }
+    }
+
+    sem_up(mutex, 0);
+    return selected_ferry;
 }
 
 void run_captain_port() {
@@ -102,23 +118,21 @@ void run_captain_port() {
 
     // pamiec wspoldzielona stan stanowisk
     key_t shm_key = ftok("/tmp", 'M');
-    int shmid = shmget(shm_key,
-                      sizeof(SecurityStation) * NUM_STATIONS, IPC_CREAT | 0666);
+    int shmid = shmget(shm_key, sizeof(SecurityStation) * NUM_STATIONS, IPC_CREAT | 0666);
     if (shmid == -1) {
         dprintf(STDERR_FILENO, "[CAPTAIN PORT] failed to create shared memory\n");
         _exit(1);
     }
 
     SecurityStation* stations = (SecurityStation*) shmat(shmid, nullptr, 0);
-
     if (stations == (void*) -1) {
-    perror("shmat stations");
-    _exit(1);
+        perror("shmat stations");
+        _exit(1);
     }
 
     for (int i = 0; i < NUM_STATIONS; i++) {
         stations[i].count = 0;
-        stations[i].gender = -1; // brak
+        stations[i].gender = -1;
     }
 
     // mutex do ochrony stanu
@@ -131,147 +145,184 @@ void run_captain_port() {
     int trap_sem = semget(trap_key, 1, IPC_CREAT | 0666);
     semctl(trap_sem, 0, SETVAL, GANGWAY_CAPACITY);
 
-    // prom P
-    key_t ferry_key = ftok("/tmp", 'F');
-    int ferry_shmid = shmget(ferry_key, sizeof(FerryState), IPC_CREAT | 0666);
-    FerryState* ferry = (FerryState*) shmat(ferry_shmid, nullptr, 0);
-
-    if (ferry == (void*) -1) {
-    perror("shmat ferry");
-    _exit(1);
-    }
-
-    ferry->onboard = 0;
-    ferry->in_waiting = 0;
-
+    // port state (stare ferry)
     key_t port_state_key = ftok("/tmp", 'S');
     int port_shmid = shmget(port_state_key, sizeof(PortState), IPC_CREAT | 0666);
     if (port_shmid == -1) {
         perror("[CAPTAIN PORT] shmget port_state");
         _exit(1);
     }
-    
+
     PortState* port_state = (PortState*) shmat(port_shmid, nullptr, 0);
     if (port_state == (void*) -1) {
         perror("[CAPTAIN PORT] shmat port_state");
         _exit(1);
     }
-    
-    port_state->accepting_passengers = 1;  // port otwarty
+
+    // inicjalizacja stanu portu i promow
+    port_state->accepting_passengers = 1;
     port_state->passengers_onboard = 0;
-    port_state->ferry_captain_pid = -1;  // jeszcze nie znany
+
+    // inicjalizuj kazdy prom
+    for (int i = 0; i < NUM_FERRIES; i++) {
+        port_state->ferries[i].onboard = 0;
+        port_state->ferries[i].in_waiting = 0;
+        port_state->ferries[i].capacity = FERRY_CAPACITY;
+        port_state->ferries[i].baggage_limit = MAX_BAGGAGE;
+        port_state->ferries[i].status = FERRY_AVAILABLE;
+        port_state->ferries[i].captain_pid = -1;
+        port_state->ferries[i].signal_sent = false;
+    }
+
+    port_state->ferries[0].baggage_limit = 20;  // Prom 0: 20kg
+    port_state->ferries[1].baggage_limit = 15;  // Prom 1: 15kg
+    port_state->ferries[2].baggage_limit = 25;  // Prom 2: 25kg
 
     dprintf(STDOUT_FILENO, "[CAPTAIN PORT] PID=%d waiting for passengers...\n", getpid());
+    dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Initialized %d ferries:\n", NUM_FERRIES);
+    dprintf(STDOUT_FILENO, "  - Ferry 0: capacity=%d, baggage_limit=%dkg\n", 
+        FERRY_CAPACITY, port_state->ferries[0].baggage_limit);
+    dprintf(STDOUT_FILENO, "  - Ferry 1: capacity=%d, baggage_limit=%dkg\n", 
+        FERRY_CAPACITY, port_state->ferries[1].baggage_limit);
+    dprintf(STDOUT_FILENO, "  - Ferry 2: capacity=%d, baggage_limit=%dkg\n", 
+        FERRY_CAPACITY, port_state->ferries[2].baggage_limit);
 
     int accepted_count = 0;
-    int current_ferry_passengers = 0;
-    bool signal_sent_for_current_ferry = false;
 
     while (true) {
-
         // sprawdzanie czy port zamkniety
         if (port_closed) {
-        port_state->accepting_passengers = 0;
-        dprintf(STDOUT_FILENO, "[CAPTAIN PORT] SIGUSR2 received - Port CLOSED. No more passengers allowed.\n");
-            
-        // czekanie az pasazerowie opuszcza promy
-        dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Waiting for all passengers to be delivered...\n");
-        while (true) {
-            sem_down(mutex, 0);
-            int remaining = port_state->passengers_onboard;
-            sem_up(mutex, 0);
-                
-            if (remaining == 0) break;
-                
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Still %d passengers onboard, waiting...\n", remaining);
-            sleep(1);
+            port_state->accepting_passengers = 0;
+            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] SIGUSR2 received - Port CLOSED. No more passengers allowed.\n");
+
+            // czekanie az pasazerowie opuszcza promy
+            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Waiting for all passengers to be delivered...\n");
+            while (true) {
+                sem_down(mutex, 0);
+                int remaining = port_state->passengers_onboard;
+                sem_up(mutex, 0);
+
+                if (remaining == 0) break;
+
+                dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Still %d passengers onboard, waiting...\n", remaining);
+                sleep(1);
             }
-            
-        dprintf(STDOUT_FILENO, "[CAPTAIN PORT] All passengers delivered. Shutting down.\n");
-        break;
+
+            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] All passengers delivered. Shutting down.\n");
+            break;
         }
 
-        // pasazerowie
+        // obsluga pasazerow z przydzielaniem do promu
         PassengerMessage msg;
-        ssize_t msg_result = msgrcv(msgid, &msg, 
-                                     sizeof(PassengerMessage) - sizeof(long), 
-                                     MSG_TYPE_PASSENGER, 
+        ssize_t msg_result = msgrcv(msgid, &msg,
+                                     sizeof(PassengerMessage) - sizeof(long),
+                                     MSG_TYPE_PASSENGER,
                                      IPC_NOWAIT);
-    
+
         if (msg_result != -1) {
-        dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Passenger id=%d baggage=%d kg\n", 
-                msg.passenger_id, msg.baggage_weight);
+            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Passenger id=%d baggage=%d kg\n",
+                    msg.passenger_id, msg.baggage_weight);
 
-        DecisionMessage decision;
-        decision.mtype = MSG_TYPE_DECISION_BASE + msg.passenger_id;
-        decision.passenger_id = msg.passenger_id;
+            DecisionMessage decision;
+            decision.mtype = MSG_TYPE_DECISION_BASE + msg.passenger_id;
+            decision.passenger_id = msg.passenger_id;
 
-        if (msg.baggage_weight > MAX_BAGGAGE) {
-            decision.accepted = 0;
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Passenger id=%d REJECTED (baggage too heavy)\n", 
-                    msg.passenger_id);
-        } else {
-            decision.accepted = 1;
-            accepted_count++;
-            current_ferry_passengers++;
-            
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Passenger id=%d ACCEPTED (ferry: %d/%d)\n", 
-                    msg.passenger_id, current_ferry_passengers, FERRY_CAPACITY);
-        }
+            // przydziel pasazera do promu
+            int ferry_id = assign_passenger_to_ferry(port_state, mutex);
 
-        msgsnd(msgid, &decision, sizeof(DecisionMessage) - sizeof(long), 0);
-        
-        continue;
-        }
+            if (ferry_id == -1) {
+                // brak dostepnych promow
+                decision.accepted = 0;
+                decision.ferry_id = -1;
+                dprintf(STDOUT_FILENO,
+                        "[CAPTAIN PORT] Passenger id=%d REJECTED (all ferries full)\n",
+                        msg.passenger_id);
+            } else if (msg.baggage_weight > port_state->ferries[ferry_id].baggage_limit) {
+                // bagaz za ciezki
+                decision.accepted = 0;
+                decision.ferry_id = -1;
+                dprintf(STDOUT_FILENO,
+                        "[CAPTAIN PORT] Passenger id=%d REJECTED (baggage too heavy)\n",
+                        msg.passenger_id);
+            } else {
+                // zaakceptowany
+                decision.accepted = 1;
+                decision.ferry_id = ferry_id;
+                accepted_count++;
 
-        // sprawdzenie czy prom odplynal
-        FerryDepartureMessage departure_msg;
-        if (msgrcv(msgid, &departure_msg, 
-                sizeof(FerryDepartureMessage) - sizeof(long),
-                MSG_TYPE_FERRY_DEPARTED, IPC_NOWAIT) != -1) {
-            
-            dprintf(STDOUT_FILENO, 
-                "[CAPTAIN PORT] Ferry departed with %d passengers. Ready for next ferry.\n",
-                departure_msg.passengers_count);
-            
-            current_ferry_passengers = 0;
-            signal_sent_for_current_ferry = false;
+                sem_down(mutex, 0);
+                int total = port_state->ferries[ferry_id].in_waiting +
+                           port_state->ferries[ferry_id].onboard;
+                sem_up(mutex, 0);
+
+                dprintf(STDOUT_FILENO,
+                        "[CAPTAIN PORT] Passenger id=%d ACCEPTED (ferry %d: %d/%d)\n",
+                        msg.passenger_id, ferry_id, total + 1,
+                        port_state->ferries[ferry_id].capacity);
+            }
+
+            msgsnd(msgid, &decision, sizeof(DecisionMessage) - sizeof(long), 0);
             continue;
         }
-        
-        //sigusr1
-        if (!signal_sent_for_current_ferry) {
+
+        // obsluga komunikatow o odplynieciu promu
+        FerryDepartureMessage departure_msg;
+        if (msgrcv(msgid, &departure_msg,
+                   sizeof(FerryDepartureMessage) - sizeof(long),
+                   MSG_TYPE_FERRY_DEPARTED, IPC_NOWAIT) != -1) {
+
+            dprintf(STDOUT_FILENO,
+                "[CAPTAIN PORT] Ferry %d departed with %d passengers. Ready for next ferry.\n",
+                departure_msg.ferry_id, departure_msg.passengers_count);
+
+            // reset flagi sygnalu dla tego promu
             sem_down(mutex, 0);
-            int in_waiting = ferry->in_waiting;
-            int onboard = ferry->onboard;
-            int total_ready = in_waiting + onboard;
-            pid_t ferry_captain_pid = port_state->ferry_captain_pid;
+            port_state->ferries[departure_msg.ferry_id].signal_sent = false;
             sem_up(mutex, 0);
 
-            if (total_ready >= FERRY_CAPACITY / 2) {
-                dprintf(STDOUT_FILENO,
-                    "[CAPTAIN PORT] Half capacity reached (%d waiting + %d onboard = %d/%d), sending EARLY DEPARTURE signal to PID=%d\n",
-                    in_waiting, onboard, total_ready, FERRY_CAPACITY, ferry_captain_pid);
+            continue;
+        }
 
-                if (ferry_captain_pid > 1 && ferry_captain_pid != getpid()) {
-                    if (kill(ferry_captain_pid, SIGUSR1) == -1) {
-                        perror("[CAPTAIN PORT] kill SIGUSR1 failed");
-                    } else {
-                        dprintf(STDOUT_FILENO, "[CAPTAIN PORT] SIGUSR1 sent successfully\n");
-                        signal_sent_for_current_ferry = true;
-                    }
-                } else {
-                    dprintf(STDERR_FILENO,
-                    "[CAPTAIN PORT] Ferry captain PID not yet available (pid=%d), waiting...\n",
-                    ferry_captain_pid);
-                    }
+        // SIGUSR1 dla kazdego promu osobno
+        sem_down(mutex, 0);
+        for (int i = 0; i < NUM_FERRIES; i++) {
+            Ferry* ferry = &port_state->ferries[i];
 
+            // pomin promy ktore nie sa dostepne lub juz otrzymaly sygnal
+            if (ferry->status == FERRY_TRAVELING ||
+                ferry->status == FERRY_SHUTDOWN ||
+                ferry->signal_sent) {
                 continue;
             }
+
+            int total_ready = ferry->in_waiting + ferry->onboard;
+
+            // SIGUSR1 gdy >=50% zapelnienia
+            if (total_ready >= ferry->capacity / 2 && ferry->captain_pid > 0) {
+                sem_up(mutex, 0);  // zwolnienie mutexy przed killem
+
+                dprintf(STDOUT_FILENO,
+                    "[CAPTAIN PORT] Ferry %d half capacity (%d/%d), sending EARLY DEPARTURE to PID=%d\n",
+                    i, total_ready, ferry->capacity, ferry->captain_pid);
+
+                if (kill(ferry->captain_pid, SIGUSR1) == -1) {
+                    perror("[CAPTAIN PORT] kill SIGUSR1 failed");
+                } else {
+                    dprintf(STDOUT_FILENO, "[CAPTAIN PORT] SIGUSR1 sent successfully to ferry %d\n", i);
+
+                    sem_down(mutex, 0);
+                    ferry->signal_sent = true;
+                    sem_up(mutex, 0);
+                }
+
+                sem_down(mutex, 0);  // przywrocenie mutexy do petli
+            }
         }
-         usleep(100000);
+        sem_up(mutex, 0);
+
+        usleep(100000);
     }
+
     shmdt(port_state);
-    shmdt(ferry);
     shmdt(stations);
 }

@@ -7,6 +7,7 @@
 #include "passenger.h"
 #include "captain_port.h"
 #include "captain_ferry.h"
+#include "security.h"
 
 int main() {
     signal(SIGUSR1, SIG_IGN);
@@ -22,14 +23,21 @@ int main() {
     pid_t port_pid = pid;
     sleep(1);
 
-    pid = fork();
-    if (pid == 0) {
-        run_captain_ferry();
-        _exit(0);
+    dprintf(STDOUT_FILENO, "[MAIN] Starting %d ferries...\n", NUM_FERRIES);
+
+        for (int i = 0; i < NUM_FERRIES; i++) {
+        pid = fork();
+        if (pid == 0) {
+            run_captain_ferry(i);  // przekazanie id promu
+            _exit(0);
+        }
+        dprintf(STDOUT_FILENO, "[MAIN] Started ferry %d with PID=%d\n", i, pid);
+        usleep(100000);  // 100ms delay
     }
+    
     sleep(1);
 
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 30; i++) {
         pid = fork();
         if (pid == 0) {
             run_passenger(i);
