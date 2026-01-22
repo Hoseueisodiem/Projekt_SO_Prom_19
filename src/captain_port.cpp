@@ -167,6 +167,7 @@ void run_captain_port() {
     for (int i = 0; i < NUM_FERRIES; i++) {
         port_state->ferries[i].onboard = 0;
         port_state->ferries[i].in_waiting = 0;
+        port_state->ferries[i].in_waiting_vip = 0;
         port_state->ferries[i].capacity = FERRY_CAPACITY;
         port_state->ferries[i].baggage_limit = MAX_BAGGAGE;
         port_state->ferries[i].status = FERRY_AVAILABLE;
@@ -295,15 +296,15 @@ void run_captain_port() {
                 continue;
             }
 
-            int total_ready = ferry->in_waiting + ferry->onboard;
+            int total_ready = ferry->in_waiting + ferry->in_waiting_vip + ferry->onboard;
 
             // SIGUSR1 gdy >=50% zapelnienia
             if (total_ready >= ferry->capacity / 2 && ferry->captain_pid > 0) {
                 sem_up(mutex, 0);  // zwolnienie mutexy przed killem
 
                 dprintf(STDOUT_FILENO,
-                    "[CAPTAIN PORT] Ferry %d half capacity (%d/%d), sending EARLY DEPARTURE to PID=%d\n",
-                    i, total_ready, ferry->capacity, ferry->captain_pid);
+                    "[CAPTAIN PORT] Ferry %d half capacity (%d reg + %d VIP + %d onboard = %d/%d), sending EARLY DEPARTURE to PID=%d\n",
+                    i, ferry->in_waiting, ferry->in_waiting_vip, ferry->onboard, total_ready, ferry->capacity, ferry->captain_pid);
 
                 if (kill(ferry->captain_pid, SIGUSR1) == -1) {
                     perror("[CAPTAIN PORT] kill SIGUSR1 failed");

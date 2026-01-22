@@ -30,6 +30,7 @@ struct Ferry {
     int in_waiting;        // ile w poczekalni
     int capacity;          // pojemnosc Mp
     int baggage_limit;     // limit bagazu w kg
+    int in_waiting_vip;    // VIP w poczekalni
     FerryStatus status;    // prom status
     pid_t captain_pid;     // PID kapitana tego promu
     bool signal_sent;      // czy wyslano sigusr1

@@ -3,6 +3,7 @@
 #include <iostream>
 #include <cstdio>
 #include <signal.h>
+#include <fcntl.h>
 
 #include "passenger.h"
 #include "captain_port.h"
@@ -10,6 +11,16 @@
 #include "security.h"
 
 int main() {
+    // stdout do pliku
+    int log_fd = open("simulation.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (log_fd != -1) {
+        dup2(log_fd, STDOUT_FILENO);
+        close(log_fd);
+        // wylacz buforowanie dla natychmiastowego zapisu
+        setbuf(stdout, NULL);
+    } else {
+        perror("Failed to open simulation.log");
+    }
     signal(SIGUSR1, SIG_IGN);
     signal(SIGUSR2, SIG_IGN);
 
