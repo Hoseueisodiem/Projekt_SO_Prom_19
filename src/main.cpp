@@ -4,13 +4,30 @@
 #include <cstdio>
 #include <signal.h>
 #include <fcntl.h>
+#include <errno.h>
 
 #include "passenger.h"
 #include "captain_port.h"
 #include "captain_ferry.h"
 #include "security.h"
 
+void sigchld_handler(int sig) {
+    (void)sig;
+    int saved_errno = errno;
+    while (waitpid(-1, NULL, WNOHANG) > 0);
+    errno = saved_errno;
+}
+
 int main() {
+    struct sigaction sa;
+    sa.sa_handler = sigchld_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
+        perror("sigaction SIGCHLD");
+        return 1;
+    }
+
     // stdout do pliku
     int log_fd = open("simulation.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (log_fd != -1) {
