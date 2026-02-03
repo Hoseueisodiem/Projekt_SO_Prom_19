@@ -115,40 +115,65 @@ void run_passenger(int id) {
     key_t mutex_key = ftok("/tmp", 'X');
     int mutex = semget(mutex_key, 1, 0666);
 
-    int station = rand() % NUM_STATIONS;
+    int station;
+    if (gender == FEMALE) {
+        station = 0;
+    } else {
+        station = (id % 2 == 0) ? 1 : 2;  // mezczyzni na stanowiska 1 lub 2
+    }
 
-    //proba wejscia
+    dprintf(STDOUT_FILENO, "[PASSENGER] id=%d WAITING for security station %d\n", id, station);
+
+    // inicjalizuj licznik przed petla
+    sem_down(mutex, 0);
+    int last_total_entered = stations[station].total_entered;
+    sem_up(mutex, 0);
+
+    int skipped_count = 0;  // ile osob mnie przepuscilo
+
     while (true) {
         sem_down(mutex, 0);
 
-        if (stations[station].count == 0) {
-            stations[station].gender = gender;
-        }
+        // sprawdz ile osob weszlo od ostatniego sprawdzenia
+        int new_entries = stations[station].total_entered - last_total_entered;
+        if (new_entries > 0) {
+            skipped_count += new_entries;  // ktos mnie przepuscil
+            last_total_entered = stations[station].total_entered;
 
-        if (stations[station].gender == gender &&
-            stations[station].count < 2) {
-            stations[station].count++;
-            sem_up(mutex, 0);
-            break;
-        }
+            if (!vip && new_entries > 0) {
+                dprintf(STDOUT_FILENO, 
+                "[PASSENGER] id=%d skipped by %d passenger(s), total skipped: %d/3\n",
+                id, new_entries, skipped_count);
+            }
 
-        sem_up(mutex, 0);
-
-        if (!vip) {
-            waited++;
-            if (waited > 3) {
-                dprintf(STDOUT_FILENO, "[PASSENGER] id=%d FRUSTRATED, leaving security queue\n", id);
+            if (!vip && skipped_count > 3) {
+                sem_up(mutex, 0);
+                dprintf(STDOUT_FILENO,
+                        "[PASSENGER] id=%d FRUSTRATED after being skipped %d times, leaving security queue\n",
+                        id, skipped_count);
                 shmdt(port_state);
                 shmdt(stations);
                 return;
             }
         }
+
+        // Sprawdz czy moge wejsc
+        if (stations[station].count == 0) {
+            stations[station].gender = gender;
+        }
+
+        if (stations[station].gender == gender && stations[station].count < 2) {
+            stations[station].count++;
+            stations[station].total_entered++;  // zwieksz licznik
+            sem_up(mutex, 0);
+
+            dprintf(STDOUT_FILENO, "[PASSENGER] id=%d ENTER security station %d\n", id, station);
+            break;
+        }
+
+        sem_up(mutex, 0);
         sleep(1);
     }
-
-    dprintf(STDOUT_FILENO,
-            "[PASSENGER] id=%d ENTER security station %d\n",
-            id, station);
 
     sleep(2); // symulacja kontroli
 

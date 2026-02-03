@@ -147,6 +147,7 @@ void run_captain_port() {
     for (int i = 0; i < NUM_STATIONS; i++) {
         stations[i].count = 0;
         stations[i].gender = -1;
+        stations[i].total_entered = 0;
     }
 
     // mutex do ochrony stanu
