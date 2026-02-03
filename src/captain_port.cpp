@@ -5,6 +5,7 @@
 #include <sys/sem.h>
 #include <sys/shm.h>
 #include <signal.h>
+#include <climits>
 #include "captain_port.h"
 #include "ipc.h"
 #include "security.h"
@@ -80,25 +81,38 @@ static void cleanup_ipc() {
 }
 
 // przydzielenie pasazera do promu
-int assign_passenger_to_ferry(PortState* port_state, int mutex) {
+int assign_passenger_to_ferry(PortState* port_state, int mutex, int baggage_weight) {
     sem_down(mutex, 0);
 
     int selected_ferry = -1;
+    int min_queue = INT_MAX;  // najmniejsza kolejka
 
     // znajdz pierwszy dostepny prom z wolnym miejscem
     for (int i = 0; i < NUM_FERRIES; i++) {
         Ferry* ferry = &port_state->ferries[i];
+
+        // sprawdz czy bagaz pasuje do limitu tego promu
+        if (baggage_weight > ferry->baggage_limit) {
+            continue;  // pomin ten prom
+        }
 
         // prom musi byc dostepny lub w trakcie zaladunku
         if (ferry->status == FERRY_AVAILABLE || ferry->status == FERRY_BOARDING) {
             int total = ferry->in_waiting + ferry->onboard;
 
             if (total < ferry->capacity) {
-                selected_ferry = i;
-                ferry->status = FERRY_BOARDING;  // oznacz ze pasazerowie wsiadaja
-                break;
+                // znajdz prom z najmniejsza kolejka
+                if (total < min_queue) {
+                    min_queue = total;
+                    selected_ferry = i;
+                }
             }
         }
+    }
+
+    // ustaw status wybranego promu
+    if (selected_ferry != -1) {
+        port_state->ferries[selected_ferry].status = FERRY_BOARDING;
     }
 
     sem_up(mutex, 0);
@@ -175,9 +189,9 @@ void run_captain_port() {
         port_state->ferries[i].signal_sent = false;
     }
 
-    port_state->ferries[0].baggage_limit = 20;  // Prom 0: 20kg
-    port_state->ferries[1].baggage_limit = 15;  // Prom 1: 15kg
-    port_state->ferries[2].baggage_limit = 25;  // Prom 2: 25kg
+    port_state->ferries[0].baggage_limit = 25;  // Prom 0: xkg
+    port_state->ferries[1].baggage_limit = 20;  // Prom 1: xkg
+    port_state->ferries[2].baggage_limit = 30;  // Prom 2: xkg
 
     dprintf(STDOUT_FILENO, "[CAPTAIN PORT] PID=%d waiting for passengers...\n", getpid());
     dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Initialized %d ferries:\n", NUM_FERRIES);
@@ -229,7 +243,7 @@ void run_captain_port() {
             decision.passenger_id = msg.passenger_id;
 
             // przydziel pasazera do promu
-            int ferry_id = assign_passenger_to_ferry(port_state, mutex);
+            int ferry_id = assign_passenger_to_ferry(port_state, mutex, msg.baggage_weight);
 
             if (ferry_id == -1) {
                 // brak dostepnych promow
@@ -237,13 +251,6 @@ void run_captain_port() {
                 decision.ferry_id = -1;
                 dprintf(STDOUT_FILENO,
                         "[CAPTAIN PORT] Passenger id=%d REJECTED (all ferries full)\n",
-                        msg.passenger_id);
-            } else if (msg.baggage_weight > port_state->ferries[ferry_id].baggage_limit) {
-                // bagaz za ciezki
-                decision.accepted = 0;
-                decision.ferry_id = -1;
-                dprintf(STDOUT_FILENO,
-                        "[CAPTAIN PORT] Passenger id=%d REJECTED (baggage too heavy)\n",
                         msg.passenger_id);
             } else {
                 // zaakceptowany

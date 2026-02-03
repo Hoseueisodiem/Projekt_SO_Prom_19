@@ -65,17 +65,17 @@ int main() {
     
     sleep(1);
 
-    for (int i = 0; i < 30; i++) {
+    for (int i = 0; i < 1000; i++) {
         pid = fork();
         if (pid == 0) {
             run_passenger(i);
             _exit(0);
         }
-        usleep(200000); //odstep miedzy pasazerami
+        usleep(10000); //odstep miedzy pasazerami
     }
 
-    dprintf(STDOUT_FILENO, "[MAIN] Waiting 15 seconds before closing port...\n");
-    sleep(15);
+    dprintf(STDOUT_FILENO, "[MAIN] Waiting 60 seconds before closing port...\n");
+    sleep(60);
     
     dprintf(STDOUT_FILENO, "[MAIN] Sending SIGUSR2 to close port (PID=%d)\n", port_pid);
     if (kill(port_pid, SIGUSR2) == -1) {

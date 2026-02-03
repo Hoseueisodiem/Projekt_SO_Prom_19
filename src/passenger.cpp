@@ -188,6 +188,8 @@ void run_passenger(int id) {
     // trap
     key_t trap_key = ftok("/tmp", 'T');
     int trap_sem = semget(trap_key, 1, 0666);
+    
+    waited = 0;  // Reset licznika dla poczekalni
 
     while (true) {
         sem_down(mutex, 0);
@@ -195,8 +197,6 @@ void run_passenger(int id) {
         int current_onboard = my_ferry->onboard;
         int vip_count = my_ferry->in_waiting_vip;
 
-        // VIP moze wejsc jesli prom ma miejsce
-        // regularny moze wejsc tylko jesli prom ma miejsce i brak VIP w kolejce
         bool can_enter = false;
         if (vip) {
             can_enter = ferry_has_space;
@@ -214,10 +214,11 @@ void run_passenger(int id) {
                 dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Waiting for %d VIP passengers to board first\n",
                     id, vip_count);
             }
-
+            
+            // frustracja tylko regularni
             if (!vip) {
                 waited++;
-                if (waited > 3) {
+                if (waited > 40) {
                     dprintf(STDOUT_FILENO,
                         "[PASSENGER] id=%d FRUSTRATED, ferry full or waiting for VIP too long\n", id);
                     sem_down(mutex, 0);
@@ -229,6 +230,7 @@ void run_passenger(int id) {
                     return;
                 }
             }
+            
             sleep(1);
             continue;
         }
@@ -238,76 +240,46 @@ void run_passenger(int id) {
         if (semop(trap_sem, &sb, 1) != -1) {
             // zdobyty trap, ale sprawdz jeszcze raz pojemnosc
             sem_down(mutex, 0);
-            bool still_has_space = (my_ferry->onboard < my_ferry->capacity);
-            sem_up(mutex, 0);
+            
+            // triple-check pojemnosci
+            if (my_ferry->onboard < my_ferry->capacity) {
+                // BOARDING
+                if (vip) my_ferry->in_waiting_vip--;
+                else my_ferry->in_waiting--;
 
-            if (still_has_space) {
+                my_ferry->onboard++;
+                port_state->passengers_onboard++;
+
+                int final_onboard = my_ferry->onboard;
+                int final_waiting = my_ferry->in_waiting;
+                int final_vip_waiting = my_ferry->in_waiting_vip;
+                int total_onboard = port_state->passengers_onboard;
+
+                sem_up(mutex, 0);
+                sem_up(trap_sem, 0);
+
+                dprintf(STDOUT_FILENO, 
+                        "[PASSENGER] id=%d %sBOARDED ferry %d (%d reg, %d VIP waiting, %d/%d onboard, %d total)\n",
+                        id, vip ? "(VIP) " : "", assigned_ferry_id,
+                        final_waiting, final_vip_waiting,
+                        final_onboard, my_ferry->capacity,
+                        total_onboard);
+
                 break;
             } else {
                 // prom zapelnil sie w miedzyczasie
+                sem_up(mutex, 0);
                 sem_up(trap_sem, 0);
-                dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Ferry became full while on gangway, releasing\n", id);
-
-                if (!vip) {
-                    waited++;
-                    if (waited > 3) {
-                        dprintf(STDOUT_FILENO,
-                            "[PASSENGER] id=%d FRUSTRATED, ferry full too long\n", id);
-                        sem_down(mutex, 0);
-                        if (vip) my_ferry->in_waiting_vip--;
-                        else my_ferry->in_waiting--;
-                        sem_up(mutex, 0);
-
-                        shmdt(port_state);
-                        shmdt(stations);
-                        return;
-                    }
-                }
+                dprintf(STDOUT_FILENO, 
+                        "[PASSENGER] id=%d Ferry became full while on gangway\n", id);
                 sleep(1);
                 continue;
             }
         }
 
-        if (!vip) {
-            waited++;
-            if (waited > 3) {
-                dprintf(STDOUT_FILENO,
-                    "[PASSENGER] id=%d FRUSTRATED, gangway queue too long\n", id);
-                sem_down(mutex, 0);
-                my_ferry->in_waiting--;
-                sem_up(mutex, 0);
-
-                shmdt(port_state);
-                shmdt(stations);
-                return;
-            }
-        }
+        // nie udalo sie wejsc na trap czekaj
         sleep(1);
     }
-
-    // wyjscie z wlasciwej kolejki (VIP lub regularnej)
-    sem_down(mutex, 0);
-    if (vip) my_ferry->in_waiting_vip--;
-    else my_ferry->in_waiting--;
-
-    if (my_ferry->onboard < my_ferry->capacity) {
-        my_ferry->onboard++;
-        port_state->passengers_onboard++;
-        dprintf(STDOUT_FILENO, "[PASSENGER] id=%d %sBOARDED ferry %d (%d reg, %d VIP waiting, %d/%d onboard, %d total)\n",
-                id, vip ? "(VIP) " : "", assigned_ferry_id,
-                my_ferry->in_waiting, my_ferry->in_waiting_vip,
-                my_ferry->onboard, my_ferry->capacity,
-                port_state->passengers_onboard);
-    } else {
-        // prom zapelnij sie w miedzyczasie
-        if (vip) my_ferry->in_waiting_vip++;
-        else my_ferry->in_waiting++;
-        dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Ferry %d became full, back to waiting\n",
-                id, assigned_ferry_id);
-    }
-    sem_up(mutex, 0);
-
-    sem_up(trap_sem, 0);
 
     //cleanup
     shmdt(port_state);
