@@ -17,3 +17,7 @@ logs/
 .DS_Store
 Thumbs.db
 
+# Binarne pliki testow
+tests/test_semaphore
+tests/test_shm
+tests/test_msgqueue
