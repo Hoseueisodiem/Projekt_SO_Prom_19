@@ -11,49 +11,25 @@
 #include "captain_ferry.h"
 #include "security.h"
 
-void sigchld_handler(int sig) {
-    (void)sig;
-    int saved_errno = errno;
-    while (waitpid(-1, NULL, WNOHANG) > 0);
-    errno = saved_errno;
-}
-
 int main() {
-    struct sigaction sa;
-    sa.sa_handler = sigchld_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
-    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
-        perror("sigaction SIGCHLD");
-        return 1;
-    }
-
-    // stdout do pliku
-    int log_fd = open("simulation.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (log_fd != -1) {
-        dup2(log_fd, STDOUT_FILENO);
-        close(log_fd);
-        // wylacz buforowanie dla natychmiastowego zapisu
-        setbuf(stdout, NULL);
-    } else {
-        perror("Failed to open simulation.log");
-    }
-    signal(SIGUSR1, SIG_IGN);
-    signal(SIGUSR2, SIG_IGN);
-
+    srand(time(nullptr));
+    
     pid_t pid;
-
-    pid = fork();
-    if (pid == 0) {
+    
+    // Tworzenie procesu portu
+    pid_t port_pid = fork();
+    if (port_pid == 0) {
+        // Proces dziecko - port
         run_captain_port();
         _exit(0);
     }
-    pid_t port_pid = pid;
-    sleep(1);
-
+    
+    dprintf(STDOUT_FILENO, "[MAIN] Started port with PID=%d\n", port_pid);
+    sleep(1);  // czas portowi na inicjalizację
+    
+    // Tworzenie procesow promow
     dprintf(STDOUT_FILENO, "[MAIN] Starting %d ferries...\n", NUM_FERRIES);
-
-        for (int i = 0; i < NUM_FERRIES; i++) {
+    for (int i = 0; i < NUM_FERRIES; i++) {
         pid = fork();
         if (pid == 0) {
             run_captain_ferry(i);  // przekazanie id promu
@@ -64,8 +40,10 @@ int main() {
     }
     
     sleep(1);
-
-    for (int i = 0; i < 1000; i++) {
+    
+    // Tworzenie procesow pasazerow
+    int num_passengers = 1000;
+    for (int i = 0; i < num_passengers; i++) {
         pid = fork();
         if (pid == 0) {
             run_passenger(i);
@@ -73,7 +51,12 @@ int main() {
         }
         usleep(10000); //odstep miedzy pasazerami
     }
-
+    
+    // Liczba wszystkich procesów potomnych
+    int total_processes = 1 + NUM_FERRIES + num_passengers;  // port + promy + pasażerowie
+    
+    dprintf(STDOUT_FILENO, "[MAIN] Created %d processes total (1 port + %d ferries + %d passengers)\n", 
+            total_processes, NUM_FERRIES, num_passengers);
     dprintf(STDOUT_FILENO, "[MAIN] Waiting 60 seconds before closing port...\n");
     sleep(60);
     
@@ -83,11 +66,17 @@ int main() {
     } else {
         dprintf(STDOUT_FILENO, "[MAIN] Port closure signal sent successfully\n");
     }
-
-    // czekanie na procesy wszystkie
-    while (wait(nullptr) > 0);
     
-    dprintf(STDOUT_FILENO, "[MAIN] All processes finished. Exiting.\n");
+    // Czekanie na wszystkie procesy potomne
+    dprintf(STDERR_FILENO, "[MAIN] Waiting for %d processes to finish...\n", total_processes);
+    for (int i = 0; i < total_processes; i++) {
+        int status;
+        pid_t finished_pid = wait(&status);
+        if (finished_pid > 0 && i % 100 == 0) {  // Log co 100 procesow
+            dprintf(STDERR_FILENO, "[MAIN] Progress: %d/%d processes finished\n", i+1, total_processes);
+        }
+    }
+    
+    dprintf(STDERR_FILENO, "[MAIN] All %d processes finished. Exiting.\n", total_processes);
     return 0;
 }
-

@@ -331,7 +331,29 @@ void run_captain_port() {
 
         usleep(100000);
     }
+    dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Waiting for all ferries to shut down...\n");
+    int max_wait = 30;  // Max 30 sekund
+    for (int i = 0; i < max_wait; i++) {
+    sem_down(mutex, 0);
+    bool all_shutdown = true;
+    for (int j = 0; j < NUM_FERRIES; j++) {
+        if (port_state->ferries[j].status != FERRY_SHUTDOWN) {
+            all_shutdown = false;
+            break;
+        }
+    }
+    sem_up(mutex, 0);
+    
+    if (all_shutdown) {
+        dprintf(STDOUT_FILENO, "[CAPTAIN PORT] All ferries shut down.\n");
+        break;
+    }
+    
+    dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Waiting for ferries to shut down (%d/%d)...\n", i+1, max_wait);
+    sleep(1);
+}
 
     shmdt(port_state);
     shmdt(stations);
+    cleanup_ipc();
 }
