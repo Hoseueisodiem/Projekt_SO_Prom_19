@@ -6,6 +6,7 @@
 #include <sys/shm.h>
 #include <signal.h>
 #include <climits>
+#include <vector>
 #include "captain_port.h"
 #include "ipc.h"
 #include "security.h"
@@ -119,6 +120,41 @@ int assign_passenger_to_ferry(PortState* port_state, int mutex, int baggage_weig
     return selected_ferry;
 }
 
+// kolejka oczekujacych pasazerow (gdy wszystkie promy pelne/w podrozy)
+static void process_waiting_queue(std::vector<PassengerMessage>& waiting_queue,
+                                   PortState* port_state, int mutex, int msgid) {
+    if (waiting_queue.empty()) return;
+
+    // probuj przydzielic pasazerow z kolejki do promow
+    std::vector<PassengerMessage> still_waiting;
+
+    for (auto& pmsg : waiting_queue) {
+        int ferry_id = assign_passenger_to_ferry(port_state, mutex, pmsg.baggage_weight);
+
+        if (ferry_id != -1) {
+            DecisionMessage decision;
+            decision.mtype = MSG_TYPE_DECISION_BASE + pmsg.passenger_id;
+            decision.passenger_id = pmsg.passenger_id;
+            decision.accepted = 1;
+            decision.ferry_id = ferry_id;
+
+            dprintf(STDOUT_FILENO,
+                    "[CAPTAIN PORT] Passenger id=%d FROM QUEUE assigned to ferry %d (current: %d waiting, %d onboard, capacity: %d)\n",
+                    pmsg.passenger_id, ferry_id,
+                    port_state->ferries[ferry_id].in_waiting,
+                    port_state->ferries[ferry_id].onboard,
+                    port_state->ferries[ferry_id].capacity);
+
+            msgsnd(msgid, &decision, sizeof(DecisionMessage) - sizeof(long), 0);
+        } else {
+            still_waiting.push_back(pmsg);
+        }
+    }
+
+    waiting_queue = still_waiting;
+
+}
+
 void run_captain_port() {
     signal(SIGUSR2, handle_sigusr2);
     cleanup_ipc();
@@ -205,12 +241,31 @@ void run_captain_port() {
         FERRY_CAPACITY, port_state->ferries[2].baggage_limit);
 
     int accepted_count = 0;
+    std::vector<PassengerMessage> waiting_queue;
 
     while (true) {
         // sprawdzanie czy port zamkniety
         if (port_closed) {
             port_state->accepting_passengers = 0;
             dprintf(STDOUT_FILENO, "[CAPTAIN PORT] SIGUSR2 received - Port CLOSED. No more passengers allowed.\n");
+
+            // przetworz reszte kolejki - przydziel kogo sie da, reszta odrzucona
+            process_waiting_queue(waiting_queue, port_state, mutex, msgid);
+
+            // odrzuc pozostalych w kolejce
+            for (auto& pmsg : waiting_queue) {
+                DecisionMessage decision;
+                decision.mtype = MSG_TYPE_DECISION_BASE + pmsg.passenger_id;
+                decision.passenger_id = pmsg.passenger_id;
+                decision.accepted = 0;
+                decision.ferry_id = -1;
+                decision.reject_reason = REJECT_PORT_CLOSED;
+                msgsnd(msgid, &decision, sizeof(DecisionMessage) - sizeof(long), 0);
+                dprintf(STDOUT_FILENO,
+                        "[CAPTAIN PORT] Passenger id=%d REJECTED from queue (port closing)\n",
+                        pmsg.passenger_id);
+            }
+            waiting_queue.clear();
 
             // czekanie az pasazerowie opuszcza promy
             dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Waiting for all passengers to be delivered...\n");
@@ -257,28 +312,28 @@ void run_captain_port() {
                     }
                 }
 
-                decision.accepted = 0;
-                decision.ferry_id = -1;
-
                 if (baggage_too_heavy) {
+                    // bagaz za ciezki - odrzuc od razu
+                    decision.accepted = 0;
+                    decision.ferry_id = -1;
+                    decision.reject_reason = REJECT_BAGGAGE;
                     dprintf(STDOUT_FILENO,
                             "[CAPTAIN PORT] Passenger id=%d REJECTED (baggage %dkg exceeds all ferry limits: max 30kg)\n",
                             msg.passenger_id, msg.baggage_weight);
+                    msgsnd(msgid, &decision, sizeof(DecisionMessage) - sizeof(long), 0);
                 } else {
+                    // promy pelne/w podrozy - dodaj do kolejki, NIE wysylaj decision
+                    waiting_queue.push_back(msg);
                     dprintf(STDOUT_FILENO,
-                            "[CAPTAIN PORT] Passenger id=%d REJECTED (all suitable ferries full or traveling)\n",
-                            msg.passenger_id);
+                            "[CAPTAIN PORT] Passenger id=%d QUEUED (all suitable ferries full or traveling, queue size: %zu)\n",
+                            msg.passenger_id, waiting_queue.size());
                 }
+                continue;
             } else {
                 // zaakceptowany
                 decision.accepted = 1;
                 decision.ferry_id = ferry_id;
                 accepted_count++;
-
-                sem_down(mutex, 0);
-                int total = port_state->ferries[ferry_id].in_waiting +
-                           port_state->ferries[ferry_id].onboard;
-                sem_up(mutex, 0);
 
                 dprintf(STDOUT_FILENO,
                         "[CAPTAIN PORT] Passenger id=%d ACCEPTED, assigned to ferry %d (current: %d waiting, %d onboard, capacity: %d)\n",
@@ -306,6 +361,9 @@ void run_captain_port() {
             sem_down(mutex, 0);
             port_state->ferries[departure_msg.ferry_id].signal_sent = false;
             sem_up(mutex, 0);
+
+            // prom odplynal - przetworz kolejke oczekujacych (promy wrocily = wolne miejsca)
+            process_waiting_queue(waiting_queue, port_state, mutex, msgid);
 
             continue;
         }
@@ -346,6 +404,9 @@ void run_captain_port() {
             }
         }
         sem_up(mutex, 0);
+
+        // periodycznie przetworz kolejke oczekujacych
+        process_waiting_queue(waiting_queue, port_state, mutex, msgid);
 
         usleep(100000);
     }

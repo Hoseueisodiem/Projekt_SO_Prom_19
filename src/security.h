@@ -6,7 +6,7 @@
 #define FEMALE 1
 
 #define NUM_FERRIES 3       // liczba promów
-#define FERRY_CAPACITY 25   // P - max pasazerow na promie
+#define FERRY_CAPACITY 100   // P - max pasazerow na promie
 #define GANGWAY_CAPACITY 5 // K - max osob na trapie
 
 #define DEPARTURE_TIME 15   // T1 - co ile sekund odplywa prom

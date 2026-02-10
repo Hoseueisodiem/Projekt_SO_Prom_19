@@ -90,7 +90,11 @@ void run_passenger(int id) {
             0);
 
     if (!decision.accepted) {
-        dprintf(STDOUT_FILENO, "[PASSENGER] id=%d REJECTED (baggage too heavy)\n", id);
+        if (decision.reject_reason == REJECT_PORT_CLOSED) {
+            dprintf(STDOUT_FILENO, "[PASSENGER] id=%d REJECTED (port closed)\n", id);
+        } else {
+            dprintf(STDOUT_FILENO, "[PASSENGER] id=%d REJECTED (baggage too heavy)\n", id);
+        }
         shmdt(port_state); //cleanup
         return;
     }
@@ -130,8 +134,10 @@ void run_passenger(int id) {
 
     int skipped_count = 0;  // ile osob mnie przepuscilo
     bool has_priority = false;  // czy ma priorytet po 3 przepuszczeniach
+    int security_wait_iter = 0;
 
     while (true) {
+        security_wait_iter++;
         sem_down(mutex, 0);
 
         // Sprawdz czy port wciaz otwarty (w kolejce do kontroli)
@@ -150,7 +156,7 @@ void run_passenger(int id) {
             skipped_count += new_entries;  // ktos mnie przepuscil
             last_total_entered = stations[station].total_entered;
 
-            if (!vip && new_entries > 0) {
+            if (!vip && new_entries > 0 && security_wait_iter % 5 == 1) {
                 dprintf(STDOUT_FILENO,
                 "[PASSENGER] id=%d skipped by %d passenger(s), total skipped: %d/3\n",
                 id, new_entries, skipped_count);
@@ -257,7 +263,9 @@ void run_passenger(int id) {
     key_t trap_key = ftok("/tmp", 'T');
     int trap_sem = semget(trap_key, 1, 0666);
 
+    int boarding_wait_iter = 0;
     while (true) {
+        boarding_wait_iter++;
         sem_down(mutex, 0);
         bool ferry_has_space = (my_ferry->onboard < my_ferry->capacity);
         int current_onboard = my_ferry->onboard;
@@ -272,13 +280,14 @@ void run_passenger(int id) {
         sem_up(mutex, 0);
 
         if (!can_enter) {
-            if (!ferry_has_space) {
-                dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Waiting, ferry %d full (%d/%d)\n",
-                    id, assigned_ferry_id, current_onboard, my_ferry->capacity);
-            } else {
-                // regularny czeka na VIP
-                dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Waiting for %d VIP passengers to board first\n",
-                    id, vip_count);
+            if (boarding_wait_iter % 5 == 1) {
+                if (!ferry_has_space) {
+                    dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Waiting, ferry %d full (%d/%d)\n",
+                        id, assigned_ferry_id, current_onboard, my_ferry->capacity);
+                } else {
+                    dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Waiting for %d VIP passengers to board first\n",
+                        id, vip_count);
+                }
             }
 
             sleep(1);
