@@ -23,7 +23,8 @@ enum FerryStatus {
 struct SecurityStation {
     int count;   // ile osob przy stanowisku
     int gender;  // MALE / FEMALE, -1 = brak
-    int total_entered;  // liczba osob ktere weszly na to stanowisko
+    int total_entered;  // liczba osob ktore weszly na to stanowisko
+    int priority_waiting;  // liczba pasazerow z priorytetem oczekujacych
 };
 // prom pojedyczny
 struct Ferry {

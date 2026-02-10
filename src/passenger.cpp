@@ -63,7 +63,6 @@ void run_passenger(int id) {
     int baggage = rand() % 40 + 1; //1-40kg
     int gender  = rand() % 2;      // male/female
     bool vip    = (rand() % 5 == 0); // ok 20% vip
-    int waited  = 0;               // frustracja
 
     dprintf(STDOUT_FILENO,
             "[PASSENGER] id=%d %s gender=%s\n",
@@ -130,44 +129,78 @@ void run_passenger(int id) {
     sem_up(mutex, 0);
 
     int skipped_count = 0;  // ile osob mnie przepuscilo
+    bool has_priority = false;  // czy ma priorytet po 3 przepuszczeniach
 
     while (true) {
         sem_down(mutex, 0);
 
+        // Sprawdz czy port wciaz otwarty (w kolejce do kontroli)
+        if (!port_state->accepting_passengers) {
+            sem_up(mutex, 0);
+            dprintf(STDOUT_FILENO,
+                "[PASSENGER] id=%d Port closed while waiting for security, leaving\n", id);
+            shmdt(port_state);
+            shmdt(stations);
+            return;
+        }
+
         // sprawdz ile osob weszlo od ostatniego sprawdzenia
         int new_entries = stations[station].total_entered - last_total_entered;
-        if (new_entries > 0) {
+        if (new_entries > 0 && !has_priority) {
             skipped_count += new_entries;  // ktos mnie przepuscil
             last_total_entered = stations[station].total_entered;
 
             if (!vip && new_entries > 0) {
-                dprintf(STDOUT_FILENO, 
+                dprintf(STDOUT_FILENO,
                 "[PASSENGER] id=%d skipped by %d passenger(s), total skipped: %d/3\n",
                 id, new_entries, skipped_count);
             }
 
-            if (!vip && skipped_count > 3) {
-                sem_up(mutex, 0);
+            // po 3 przepuszczeniach dostaje prio
+            if (!vip && skipped_count >= 3 && !has_priority) {
+                has_priority = true;
+                stations[station].priority_waiting++;
                 dprintf(STDOUT_FILENO,
-                        "[PASSENGER] id=%d FRUSTRATED after being skipped %d times, leaving security queue\n",
-                        id, skipped_count);
-                shmdt(port_state);
-                shmdt(stations);
-                return;
+                        "[PASSENGER] id=%d gained PRIORITY after being skipped %d times (priority queue: %d)\n",
+                        id, skipped_count, stations[station].priority_waiting);
             }
         }
 
-        // Sprawdz czy moge wejsc
-        if (stations[station].count == 0) {
-            stations[station].gender = gender;
+        // logika wejscia
+        bool can_enter = false;
+
+        if (has_priority) {
+            if (stations[station].count == 0) {
+                stations[station].gender = gender;
+                can_enter = true;
+            } else if (stations[station].gender == gender && stations[station].count < 2) {
+                can_enter = true;
+            }
+        } else {
+            // normalny pasazer moze wejsc tylko gdy nikt z priorytetem nie czeka
+            if (stations[station].priority_waiting == 0) {
+                if (stations[station].count == 0) {
+                    stations[station].gender = gender;
+                }
+                if (stations[station].gender == gender && stations[station].count < 2) {
+                    can_enter = true;
+                }
+            }
         }
 
-        if (stations[station].gender == gender && stations[station].count < 2) {
+        if (can_enter) {
             stations[station].count++;
-            stations[station].total_entered++;  // zwieksz licznik
+            stations[station].total_entered++;
+
+            // jesli mial prio zmniejsz licznik priorytetowych
+            if (has_priority) {
+                stations[station].priority_waiting--;
+            }
+
             sem_up(mutex, 0);
 
-            dprintf(STDOUT_FILENO, "[PASSENGER] id=%d ENTER security station %d\n", id, station);
+            dprintf(STDOUT_FILENO, "[PASSENGER] id=%d %sENTER security station %d\n",
+                    id, has_priority ? "(PRIORITY) " : "", station);
             break;
         }
 
@@ -175,7 +208,7 @@ void run_passenger(int id) {
         sleep(1);
     }
 
-    sleep(2); // symulacja kontroli
+    sleep(1); // symulacja kontroli
 
     dprintf(STDOUT_FILENO,
             "[PASSENGER] id=%d LEAVE security station %d\n",
@@ -186,6 +219,16 @@ void run_passenger(int id) {
     stations[station].count--;
     if (stations[station].count == 0) {
         stations[station].gender = -1;
+    }
+
+    // Sprawdz czy port wciaz otwarty PO kontroli
+    if (!port_state->accepting_passengers) {
+        sem_up(mutex, 0);
+        dprintf(STDOUT_FILENO,
+            "[PASSENGER] id=%d Port closed after security, cannot board. Leaving.\n", id);
+        shmdt(port_state);
+        shmdt(stations);
+        return;
     }
     sem_up(mutex, 0);
 
@@ -213,8 +256,6 @@ void run_passenger(int id) {
     // trap
     key_t trap_key = ftok("/tmp", 'T');
     int trap_sem = semget(trap_key, 1, 0666);
-    
-    waited = 0;  // Reset licznika dla poczekalni
 
     while (true) {
         sem_down(mutex, 0);
@@ -239,23 +280,7 @@ void run_passenger(int id) {
                 dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Waiting for %d VIP passengers to board first\n",
                     id, vip_count);
             }
-            
-            // frustracja tylko regularni
-            if (!vip) {
-                waited++;
-                if (waited > 40) {
-                    dprintf(STDOUT_FILENO,
-                        "[PASSENGER] id=%d FRUSTRATED, ferry full or waiting for VIP too long\n", id);
-                    sem_down(mutex, 0);
-                    my_ferry->in_waiting--;
-                    sem_up(mutex, 0);
 
-                    shmdt(port_state);
-                    shmdt(stations);
-                    return;
-                }
-            }
-            
             sleep(1);
             continue;
         }

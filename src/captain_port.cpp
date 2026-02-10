@@ -148,6 +148,7 @@ void run_captain_port() {
         stations[i].count = 0;
         stations[i].gender = -1;
         stations[i].total_entered = 0;
+        stations[i].priority_waiting = 0;
     }
 
     // mutex do ochrony stanu
@@ -247,12 +248,27 @@ void run_captain_port() {
             int ferry_id = assign_passenger_to_ferry(port_state, mutex, msg.baggage_weight);
 
             if (ferry_id == -1) {
-                // brak dostepnych promow
+                // sprawdz przyczyne odrzucenia
+                bool baggage_too_heavy = true;
+                for (int i = 0; i < NUM_FERRIES; i++) {
+                    if (msg.baggage_weight <= port_state->ferries[i].baggage_limit) {
+                        baggage_too_heavy = false;
+                        break;
+                    }
+                }
+
                 decision.accepted = 0;
                 decision.ferry_id = -1;
-                dprintf(STDOUT_FILENO,
-                        "[CAPTAIN PORT] Passenger id=%d REJECTED (all ferries full)\n",
-                        msg.passenger_id);
+
+                if (baggage_too_heavy) {
+                    dprintf(STDOUT_FILENO,
+                            "[CAPTAIN PORT] Passenger id=%d REJECTED (baggage %dkg exceeds all ferry limits: max 30kg)\n",
+                            msg.passenger_id, msg.baggage_weight);
+                } else {
+                    dprintf(STDOUT_FILENO,
+                            "[CAPTAIN PORT] Passenger id=%d REJECTED (all suitable ferries full or traveling)\n",
+                            msg.passenger_id);
+                }
             } else {
                 // zaakceptowany
                 decision.accepted = 1;
@@ -265,8 +281,10 @@ void run_captain_port() {
                 sem_up(mutex, 0);
 
                 dprintf(STDOUT_FILENO,
-                        "[CAPTAIN PORT] Passenger id=%d ACCEPTED (ferry %d: %d/%d)\n",
-                        msg.passenger_id, ferry_id, total + 1,
+                        "[CAPTAIN PORT] Passenger id=%d ACCEPTED, assigned to ferry %d (current: %d waiting, %d onboard, capacity: %d)\n",
+                        msg.passenger_id, ferry_id,
+                        port_state->ferries[ferry_id].in_waiting,
+                        port_state->ferries[ferry_id].onboard,
                         port_state->ferries[ferry_id].capacity);
             }
 

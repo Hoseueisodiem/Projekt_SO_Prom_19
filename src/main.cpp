@@ -2,6 +2,7 @@
 #include <sys/wait.h>
 #include <iostream>
 #include <cstdio>
+#include <ctime>
 #include <signal.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -13,7 +14,28 @@
 
 int main() {
     srand(time(nullptr));
-    
+
+    int log_fd = open("simulation.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (log_fd == -1) {
+        perror("Failed to open simulation.log");
+        return 1;
+    }
+
+    if (dup2(log_fd, STDOUT_FILENO) == -1) {
+        perror("Failed to redirect stdout");
+        close(log_fd);
+        return 1;
+    }
+    if (dup2(log_fd, STDERR_FILENO) == -1) {
+        perror("Failed to redirect stderr");
+        close(log_fd);
+        return 1;
+    }
+
+    close(log_fd);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
     pid_t pid;
     
     // Tworzenie procesu portu
@@ -57,8 +79,8 @@ int main() {
     
     dprintf(STDOUT_FILENO, "[MAIN] Created %d processes total (1 port + %d ferries + %d passengers)\n", 
             total_processes, NUM_FERRIES, num_passengers);
-    dprintf(STDOUT_FILENO, "[MAIN] Waiting 60 seconds before closing port...\n");
-    sleep(60);
+    dprintf(STDOUT_FILENO, "[MAIN] Waiting 90 seconds before closing port...\n");
+    sleep(90);
     
     dprintf(STDOUT_FILENO, "[MAIN] Sending SIGUSR2 to close port (PID=%d)\n", port_pid);
     if (kill(port_pid, SIGUSR2) == -1) {

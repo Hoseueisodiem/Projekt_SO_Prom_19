@@ -111,27 +111,39 @@ void run_captain_ferry(int ferry_id) {
         bool time_to_depart = (now - last_departure >= DEPARTURE_TIME);
 
         if (time_to_depart || early_departure) {
-            bool trap_clear = false;
+            // sprawdz czy prom jest pelny
+            sem_down(mutex, 0);
+            bool ferry_full = (my_ferry->onboard >= my_ferry->capacity);
+            sem_up(mutex, 0);
 
-            for (int i = 0; i < 30; i++) {  // 3s
-                int trap_val = semctl(trap_sem, 0, GETVAL);
-                if (trap_val == GANGWAY_CAPACITY) {
-                    trap_clear = true;
-                    break;
+            // jesli prom nie pelny czekaj az trap pusty
+            if (!ferry_full) {
+                bool trap_clear = false;
+
+                for (int i = 0; i < 30; i++) {  // 3s
+                    int trap_val = semctl(trap_sem, 0, GETVAL);
+                    if (trap_val == GANGWAY_CAPACITY) {
+                        trap_clear = true;
+                        break;
+                    }
+                    usleep(100000);
                 }
-                usleep(100000);
-            }
-            
-            if (!trap_clear) {
+
+                if (!trap_clear) {
+                    dprintf(STDOUT_FILENO,
+                        "[CAPTAIN FERRY %d] Trap occupied, skipping departure\n", ferry_id);
+                    if (early_departure) {
+                        early_departure = 0;
+                    }
+                    continue;
+                }
+            } else {
                 dprintf(STDOUT_FILENO,
-                    "[CAPTAIN FERRY %d] Trap occupied, skipping departure\n", ferry_id);
-                if (early_departure) {
-                    early_departure = 0;
-                }
-                continue;
+                    "[CAPTAIN FERRY %d] Ferry full (%d/%d), departing regardless of trap state\n",
+                    ferry_id, my_ferry->onboard, my_ferry->capacity);
             }
-            
-            // trap pusty, kontynuacja
+
+            // trap pusty lub prom pelny, kontynuacja
             
             // sprawdz czy sa pasazerowie
             sem_down(mutex, 0);
@@ -141,7 +153,7 @@ void run_captain_ferry(int ferry_id) {
             int passengers_left = port_state->passengers_onboard;
             sem_up(mutex, 0);
 
-            // jesli port zamkniety i brak pasazerow koncz
+            // jesli port zamkniety i brak pasazerow w calym systemie, koncz
             if (!accepting && passengers_left == 0 && onboard == 0) {
                 dprintf(STDOUT_FILENO,
                     "[CAPTAIN FERRY %d] Port closed, no passengers. Shutting down.\n", ferry_id);
