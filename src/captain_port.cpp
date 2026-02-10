@@ -7,6 +7,7 @@
 #include <signal.h>
 #include <climits>
 #include <vector>
+#include <sys/prctl.h>
 #include "captain_port.h"
 #include "ipc.h"
 #include "security.h"
@@ -156,6 +157,7 @@ static void process_waiting_queue(std::vector<PassengerMessage>& waiting_queue,
 }
 
 void run_captain_port() {
+    prctl(PR_SET_NAME, "kapitan_port");
     signal(SIGUSR2, handle_sigusr2);
     cleanup_ipc();
 

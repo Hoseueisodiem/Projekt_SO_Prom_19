@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <sys/prctl.h>
 
 #include "passenger.h"
 #include "ipc.h"
@@ -25,6 +26,7 @@ static void sem_up(int semid, int semnum) {
 }
 
 void run_passenger(int id) {
+    prctl(PR_SET_NAME, "pasazer");
 
     // czy port przyjmuje pasazerow
     key_t port_state_key = ftok("/tmp", 'S');

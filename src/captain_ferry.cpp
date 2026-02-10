@@ -6,6 +6,7 @@
 #include <sys/msg.h>
 #include <signal.h>
 #include <ctime>
+#include <sys/prctl.h>
 #include "captain_ferry.h"
 #include "security.h"
 #include "ipc.h"
@@ -33,6 +34,7 @@ static void handle_sigusr1(int) {
 // kapitan czeka t1 sekund, sprawdza czy trap psuty, odplywa, reset promu
 
 void run_captain_ferry(int ferry_id) {
+    prctl(PR_SET_NAME, "kapitan_prom");
     signal(SIGUSR1, handle_sigusr1);
 
     // mutex
