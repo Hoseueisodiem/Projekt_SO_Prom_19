@@ -196,8 +196,10 @@ void run_captain_port() {
 
     // trap K
     key_t trap_key = ftok("/tmp", 'T');
-    int trap_sem = semget(trap_key, 1, IPC_CREAT | 0666);
-    semctl(trap_sem, 0, SETVAL, GANGWAY_CAPACITY);
+    int trap_sem = semget(trap_key, NUM_FERRIES, IPC_CREAT | 0666);
+    for (int i = 0; i < NUM_FERRIES; i++) {
+        semctl(trap_sem, i, SETVAL, GANGWAY_CAPACITY);
+    }
 
     // port state (stare ferry)
     key_t port_state_key = ftok("/tmp", 'S');

@@ -276,7 +276,7 @@ void run_passenger(int id) {
 /*=== poczekalnia -> trap -> prom + frustracja + VIP prio ===*/
     // trap
     key_t trap_key = ftok("/tmp", 'T');
-    int trap_sem = semget(trap_key, 1, 0666);
+    int trap_sem = semget(trap_key, NUM_FERRIES, 0666);
 
     int boarding_wait_iter = 0;
     while (true) {
@@ -310,7 +310,7 @@ void run_passenger(int id) {
         }
 
         // prom ma miejsce, sprobuj wejsc na trap
-        struct sembuf sb = {0, -1, IPC_NOWAIT};
+        struct sembuf sb = {static_cast<unsigned short>(assigned_ferry_id), -1, IPC_NOWAIT};
         if (semop(trap_sem, &sb, 1) != -1) {
             // zdobyty trap, ale sprawdz jeszcze raz pojemnosc
             sem_down(mutex, 0);
@@ -330,9 +330,9 @@ void run_passenger(int id) {
                 int total_onboard = port_state->passengers_onboard;
 
                 sem_up(mutex, 0);
-                sem_up(trap_sem, 0);
+                sem_up(trap_sem, assigned_ferry_id);
 
-                dprintf(STDOUT_FILENO, 
+                dprintf(STDOUT_FILENO,
                         "[PASSENGER] id=%d %sBOARDED ferry %d (%d reg, %d VIP waiting, %d/%d onboard, %d total)\n",
                         id, vip ? "(VIP) " : "", assigned_ferry_id,
                         final_waiting, final_vip_waiting,
@@ -343,8 +343,8 @@ void run_passenger(int id) {
             } else {
                 // prom zapelnil sie w miedzyczasie
                 sem_up(mutex, 0);
-                sem_up(trap_sem, 0);
-                dprintf(STDOUT_FILENO, 
+                sem_up(trap_sem, assigned_ferry_id);
+                dprintf(STDOUT_FILENO,
                         "[PASSENGER] id=%d Ferry became full while on gangway\n", id);
                 sleep(1);
                 continue;

@@ -54,7 +54,7 @@ void run_captain_ferry(int ferry_id) {
     key_t trap_key = ftok("/tmp", 'T');
     int trap_sem = -1;
     for (int attempt = 0; attempt < 50; attempt++) {
-        trap_sem = semget(trap_key, 1, 0666);
+        trap_sem = semget(trap_key, NUM_FERRIES, 0666);
         if (trap_sem != -1) break;
         usleep(100000);
     }
@@ -123,7 +123,7 @@ void run_captain_ferry(int ferry_id) {
                 bool trap_clear = false;
 
                 for (int i = 0; i < 30; i++) {  // 3s
-                    int trap_val = semctl(trap_sem, 0, GETVAL);
+                    int trap_val = semctl(trap_sem, ferry_id, GETVAL);
                     if (trap_val == GANGWAY_CAPACITY) {
                         trap_clear = true;
                         break;
