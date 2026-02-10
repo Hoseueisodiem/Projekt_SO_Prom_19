@@ -12,6 +12,7 @@
 #define DEPARTURE_TIME 15   // T1 - co ile sekund odplywa prom
 #define TRAVEL_TIME 20       // Ti - czas podrozy tam i z powrotem
 #define MAX_BAGGAGE 20
+#define DANGEROUS_ITEM_CHANCE 15  // % szans na niebezpieczny przedmiot
 
 enum FerryStatus {
     FERRY_AVAILABLE,   // dostepny do zaladowania

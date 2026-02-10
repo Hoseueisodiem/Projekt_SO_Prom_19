@@ -63,12 +63,14 @@ void run_passenger(int id) {
     int baggage = rand() % 40 + 1; //1-40kg
     int gender  = rand() % 2;      // male/female
     bool vip    = (rand() % 5 == 0); // ok 20% vip
+    bool has_dangerous_item = (rand() % 100 < DANGEROUS_ITEM_CHANCE);
 
     dprintf(STDOUT_FILENO,
-            "[PASSENGER] id=%d %s gender=%s\n",
+            "[PASSENGER] id=%d %s gender=%s%s\n",
             id,
             vip ? "VIP" : "REGULAR",
-            gender == MALE ? "MALE" : "FEMALE");
+            gender == MALE ? "MALE" : "FEMALE",
+            has_dangerous_item ? " [HAS DANGEROUS ITEM]" : "");
 
     PassengerMessage msg;
     msg.mtype = MSG_TYPE_PASSENGER;
@@ -214,7 +216,18 @@ void run_passenger(int id) {
         sleep(1);
     }
 
-    sleep(1); // symulacja kontroli
+    usleep(100000); // symulacja kontroli (100ms)
+    if (has_dangerous_item) {
+        has_dangerous_item = false;
+        dprintf(STDOUT_FILENO,
+                "[SECURITY] id=%d DANGEROUS ITEM FOUND at station %d! Item confiscated, passenger continues.\n",
+                id, station);
+        usleep(100000); // dodatkowy czas na konfiskate (100ms)
+    } else {
+        dprintf(STDOUT_FILENO,
+                "[SECURITY] id=%d OK at station %d\n",
+                id, station);
+    }
 
     dprintf(STDOUT_FILENO,
             "[PASSENGER] id=%d LEAVE security station %d\n",
