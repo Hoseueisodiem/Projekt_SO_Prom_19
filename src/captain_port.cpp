@@ -115,6 +115,10 @@ int assign_passenger_to_ferry(PortState* port_state, int mutex, int baggage_weig
     // ustaw status wybranego promu
     if (selected_ferry != -1) {
         port_state->ferries[selected_ferry].status = FERRY_BOARDING;
+        if (!port_state->ferries[selected_ferry].boarding_allowed) {
+            port_state->ferries[selected_ferry].boarding_allowed = true;
+            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Ferry %d BOARDING OPEN\n", selected_ferry);
+        }
     }
 
     sem_up(mutex, 0);
@@ -229,6 +233,7 @@ void run_captain_port() {
         port_state->ferries[i].status = FERRY_AVAILABLE;
         port_state->ferries[i].captain_pid = -1;
         port_state->ferries[i].signal_sent = false;
+        port_state->ferries[i].boarding_allowed = false;
     }
 
     port_state->ferries[0].baggage_limit = 25;  // Prom 0: xkg
@@ -364,6 +369,7 @@ void run_captain_port() {
             // reset flagi sygnalu dla tego promu
             sem_down(mutex, 0);
             port_state->ferries[departure_msg.ferry_id].signal_sent = false;
+            port_state->ferries[departure_msg.ferry_id].boarding_allowed = false;
             sem_up(mutex, 0);
 
             // prom odplynal - przetworz kolejke oczekujacych (promy wrocily = wolne miejsca)

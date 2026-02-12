@@ -273,7 +273,35 @@ void run_passenger(int id) {
                 id, assigned_ferry_id, reg_waiting);
     }
 
-/*=== poczekalnia -> trap -> prom + frustracja + VIP prio ===*/
+/*=== czekanie na ogloszenie boardingu przez kapitana portu ===*/
+    while (true) {
+        sem_down(mutex, 0);
+        bool boarding_open = my_ferry->boarding_allowed;
+        bool port_open = port_state->accepting_passengers;
+        FerryStatus fstatus = my_ferry->status;
+        sem_up(mutex, 0);
+
+        if (boarding_open) {
+            dprintf(STDOUT_FILENO,
+                    "[PASSENGER] id=%d Boarding announced for ferry %d, proceeding to gangway\n",
+                    id, assigned_ferry_id);
+            break;
+        }
+        if (!port_open || fstatus == FERRY_SHUTDOWN) {
+            dprintf(STDOUT_FILENO,
+                    "[PASSENGER] id=%d Port closed while waiting for boarding, leaving\n", id);
+            sem_down(mutex, 0);
+            if (vip) my_ferry->in_waiting_vip--;
+            else my_ferry->in_waiting--;
+            sem_up(mutex, 0);
+            shmdt(port_state);
+            shmdt(stations);
+            return;
+        }
+        sleep(1);
+    }
+
+/*=== poczekalnia -> trap -> prom + VIP prio ===*/
     // trap
     key_t trap_key = ftok("/tmp", 'T');
     int trap_sem = semget(trap_key, NUM_FERRIES, 0666);
@@ -285,14 +313,32 @@ void run_passenger(int id) {
         bool ferry_has_space = (my_ferry->onboard < my_ferry->capacity);
         int current_onboard = my_ferry->onboard;
         int vip_count = my_ferry->in_waiting_vip;
+        FerryStatus bstatus = my_ferry->status;
+        bool bport_open = port_state->accepting_passengers;
 
         bool can_enter = false;
+        int free_spots = my_ferry->capacity - current_onboard;
         if (vip) {
             can_enter = ferry_has_space;
         } else {
-            can_enter = ferry_has_space && (vip_count == 0);
+            // regularny moze wejsc gdy: brak VIP-ow LUB jest wiecej miejsc niz VIP-ow
+            can_enter = ferry_has_space && (vip_count == 0 || free_spots > vip_count);
         }
         sem_up(mutex, 0);
+
+        // wyjscie gdy prom odplynal lub port zamkniety
+        if (bstatus == FERRY_TRAVELING || bstatus == FERRY_SHUTDOWN || !bport_open) {
+            dprintf(STDOUT_FILENO,
+                    "[PASSENGER] id=%d Ferry %d unavailable or port closed, leaving\n",
+                    id, assigned_ferry_id);
+            sem_down(mutex, 0);
+            if (vip) my_ferry->in_waiting_vip--;
+            else my_ferry->in_waiting--;
+            sem_up(mutex, 0);
+            shmdt(port_state);
+            shmdt(stations);
+            return;
+        }
 
         if (!can_enter) {
             if (boarding_wait_iter % 5 == 1) {

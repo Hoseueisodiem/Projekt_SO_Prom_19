@@ -37,6 +37,7 @@ struct Ferry {
     FerryStatus status;    // prom status
     pid_t captain_pid;     // PID kapitana tego promu
     bool signal_sent;      // czy wyslano sigusr1
+    bool boarding_allowed; // czy kapitan portu zezwolil na boarding
 };
 // stan portu
 struct PortState {
