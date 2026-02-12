@@ -276,16 +276,46 @@ void run_captain_port() {
             }
             waiting_queue.clear();
 
-            // czekanie az pasazerowie opuszcza promy
+            // otworz boarding dla wszystkich promow z czekajacymi pasazerami
+            sem_down(mutex, 0);
+            for (int i = 0; i < NUM_FERRIES; i++) {
+                int waiting = port_state->ferries[i].in_waiting + port_state->ferries[i].in_waiting_vip;
+                if (waiting > 0 && !port_state->ferries[i].boarding_allowed) {
+                    port_state->ferries[i].boarding_allowed = true;
+                    port_state->ferries[i].status = FERRY_BOARDING;
+                    dprintf(STDOUT_FILENO,
+                        "[CAPTAIN PORT] Ferry %d BOARDING OPEN (port closing, %d passengers still waiting)\n",
+                        i, waiting);
+                }
+            }
+            sem_up(mutex, 0);
+
+            // czekanie az wszyscy pasazerowie zostana przewiezieni (onboard + waiting)
             dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Waiting for all passengers to be delivered...\n");
             while (true) {
+                // otworz boarding dla promow z nowymi pasazerami (moga dojsc z kontroli)
                 sem_down(mutex, 0);
+                for (int i = 0; i < NUM_FERRIES; i++) {
+                    int waiting = port_state->ferries[i].in_waiting + port_state->ferries[i].in_waiting_vip;
+                    if (waiting > 0 && !port_state->ferries[i].boarding_allowed &&
+                        port_state->ferries[i].status != FERRY_TRAVELING) {
+                        port_state->ferries[i].boarding_allowed = true;
+                        port_state->ferries[i].status = FERRY_BOARDING;
+                        dprintf(STDOUT_FILENO,
+                            "[CAPTAIN PORT] Ferry %d BOARDING OPEN (closing, %d new passengers arrived)\n",
+                            i, waiting);
+                    }
+                }
                 int remaining = port_state->passengers_onboard;
+                int total_waiting = 0;
+                for (int i = 0; i < NUM_FERRIES; i++) {
+                    total_waiting += port_state->ferries[i].in_waiting + port_state->ferries[i].in_waiting_vip;
+                }
                 sem_up(mutex, 0);
 
-                if (remaining == 0) break;
+                if (remaining == 0 && total_waiting == 0) break;
 
-                dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Still %d passengers onboard, waiting...\n", remaining);
+                dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Still %d onboard, %d waiting. Waiting...\n", remaining, total_waiting);
                 sleep(1);
             }
 
@@ -421,26 +451,27 @@ void run_captain_port() {
         usleep(100000);
     }
     dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Waiting for all ferries to shut down...\n");
-    int max_wait = 30;  // Max 30 sekund
-    for (int i = 0; i < max_wait; i++) {
-    sem_down(mutex, 0);
-    bool all_shutdown = true;
-    for (int j = 0; j < NUM_FERRIES; j++) {
-        if (port_state->ferries[j].status != FERRY_SHUTDOWN) {
-            all_shutdown = false;
+    int wait_count = 0;
+    while (true) {
+        sem_down(mutex, 0);
+        bool all_shutdown = true;
+        for (int j = 0; j < NUM_FERRIES; j++) {
+            if (port_state->ferries[j].status != FERRY_SHUTDOWN) {
+                all_shutdown = false;
+                break;
+            }
+        }
+        sem_up(mutex, 0);
+
+        if (all_shutdown) {
+            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] All ferries shut down.\n");
             break;
         }
+
+        wait_count++;
+        dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Waiting for ferries to shut down (%d)...\n", wait_count);
+        sleep(1);
     }
-    sem_up(mutex, 0);
-    
-    if (all_shutdown) {
-        dprintf(STDOUT_FILENO, "[CAPTAIN PORT] All ferries shut down.\n");
-        break;
-    }
-    
-    dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Waiting for ferries to shut down (%d/%d)...\n", i+1, max_wait);
-    sleep(1);
-}
 
     shmdt(port_state);
     shmdt(stations);

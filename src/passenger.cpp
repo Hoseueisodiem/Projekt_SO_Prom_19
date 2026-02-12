@@ -144,15 +144,8 @@ void run_passenger(int id) {
         security_wait_iter++;
         sem_down(mutex, 0);
 
-        // Sprawdz czy port wciaz otwarty (w kolejce do kontroli)
-        if (!port_state->accepting_passengers) {
-            sem_up(mutex, 0);
-            dprintf(STDOUT_FILENO,
-                "[PASSENGER] id=%d Port closed while waiting for security, leaving\n", id);
-            shmdt(port_state);
-            shmdt(stations);
-            return;
-        }
+        // Pasazer juz zaakceptowany - kontynuuje kontrole nawet po zamknieciu portu
+        // (spec: "nie moga wejsc na odprawe" = blokuj nowych, nie wyrzucaj juz przyjętych)
 
         // sprawdz ile osob weszlo od ostatniego sprawdzenia
         int new_entries = stations[station].total_entered - last_total_entered;
@@ -242,15 +235,7 @@ void run_passenger(int id) {
         stations[station].gender = -1;
     }
 
-    // Sprawdz czy port wciaz otwarty PO kontroli
-    if (!port_state->accepting_passengers) {
-        sem_up(mutex, 0);
-        dprintf(STDOUT_FILENO,
-            "[PASSENGER] id=%d Port closed after security, cannot board. Leaving.\n", id);
-        shmdt(port_state);
-        shmdt(stations);
-        return;
-    }
+    // Pasazer przeszedl kontrole - kontynuuje do poczekalni nawet po zamknieciu portu
     sem_up(mutex, 0);
 
     // uzyj przydzielonego promu z PortState
@@ -287,9 +272,9 @@ void run_passenger(int id) {
                     id, assigned_ferry_id);
             break;
         }
-        if (!port_open || fstatus == FERRY_SHUTDOWN) {
+        if (fstatus == FERRY_SHUTDOWN) {
             dprintf(STDOUT_FILENO,
-                    "[PASSENGER] id=%d Port closed while waiting for boarding, leaving\n", id);
+                    "[PASSENGER] id=%d Ferry shutdown while waiting for boarding, leaving\n", id);
             sem_down(mutex, 0);
             if (vip) my_ferry->in_waiting_vip--;
             else my_ferry->in_waiting--;
@@ -326,10 +311,10 @@ void run_passenger(int id) {
         }
         sem_up(mutex, 0);
 
-        // wyjscie gdy prom odplynal lub port zamkniety
-        if (bstatus == FERRY_TRAVELING || bstatus == FERRY_SHUTDOWN || !bport_open) {
+        // wyjscie tylko gdy prom shutdown (jesli odplynal - czekaj na powrot)
+        if (bstatus == FERRY_SHUTDOWN) {
             dprintf(STDOUT_FILENO,
-                    "[PASSENGER] id=%d Ferry %d unavailable or port closed, leaving\n",
+                    "[PASSENGER] id=%d Ferry %d shutdown, leaving\n",
                     id, assigned_ferry_id);
             sem_down(mutex, 0);
             if (vip) my_ferry->in_waiting_vip--;

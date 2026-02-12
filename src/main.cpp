@@ -79,8 +79,8 @@ int main() {
     
     dprintf(STDOUT_FILENO, "[MAIN] Created %d processes total (1 port + %d ferries + %d passengers)\n", 
             total_processes, NUM_FERRIES, num_passengers);
-    dprintf(STDOUT_FILENO, "[MAIN] Waiting 90 seconds before closing port...\n");
-    sleep(90);
+    dprintf(STDOUT_FILENO, "[MAIN] Waiting 200 seconds before closing port...\n");
+    sleep(200);
     
     dprintf(STDOUT_FILENO, "[MAIN] Sending SIGUSR2 to close port (PID=%d)\n", port_pid);
     if (kill(port_pid, SIGUSR2) == -1) {

@@ -155,10 +155,11 @@ void run_captain_ferry(int ferry_id) {
             int passengers_left = port_state->passengers_onboard;
             sem_up(mutex, 0);
 
-            // jesli port zamkniety i brak pasazerow w calym systemie, koncz
-            if (!accepting && passengers_left == 0 && onboard == 0) {
+            // jesli port zamkniety i brak pasazerow (na promach + w poczekalni), koncz
+            int waiting_for_me = my_ferry->in_waiting + my_ferry->in_waiting_vip;
+            if (!accepting && passengers_left == 0 && onboard == 0 && waiting_for_me == 0) {
                 dprintf(STDOUT_FILENO,
-                    "[CAPTAIN FERRY %d] Port closed, no passengers. Shutting down.\n", ferry_id);
+                    "[CAPTAIN FERRY %d] Port closed, no passengers anywhere. Shutting down.\n", ferry_id);
 
                 sem_down(mutex, 0);
                 my_ferry->status = FERRY_SHUTDOWN;
@@ -253,6 +254,15 @@ void run_captain_ferry(int ferry_id) {
                 port_state->passengers_onboard -= onboard;
                 int remaining = port_state->passengers_onboard;
                 my_ferry->status = FERRY_AVAILABLE;  // prom znowu dostepny
+                // jesli sa czekajacy pasazerowie, otworz boarding od razu
+                int wait_count = my_ferry->in_waiting + my_ferry->in_waiting_vip;
+                if (wait_count > 0) {
+                    my_ferry->boarding_allowed = true;
+                    my_ferry->status = FERRY_BOARDING;
+                    dprintf(STDOUT_FILENO,
+                        "[CAPTAIN FERRY %d] %d passengers waiting, reopening boarding\n",
+                        ferry_id, wait_count);
+                }
                 sem_up(mutex, 0);
 
                 dprintf(STDOUT_FILENO,
@@ -264,11 +274,12 @@ void run_captain_ferry(int ferry_id) {
             sem_down(mutex, 0);
             accepting = port_state->accepting_passengers;
             passengers_left = port_state->passengers_onboard;
+            int still_waiting = my_ferry->in_waiting + my_ferry->in_waiting_vip;
             sem_up(mutex, 0);
 
-            if (!accepting && passengers_left == 0) {
+            if (!accepting && passengers_left == 0 && still_waiting == 0) {
                 dprintf(STDOUT_FILENO,
-                    "[CAPTAIN FERRY %d] Port closed and no passengers remaining. Shutting down.\n",
+                    "[CAPTAIN FERRY %d] Port closed, no passengers remaining or waiting. Shutting down.\n",
                     ferry_id);
 
                 sem_down(mutex, 0);

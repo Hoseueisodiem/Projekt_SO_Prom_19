@@ -7,10 +7,10 @@
 
 #define NUM_FERRIES 3       // liczba promów
 #define FERRY_CAPACITY 100   // P - max pasazerow na promie
-#define GANGWAY_CAPACITY 5 // K - max osob na trapie
+#define GANGWAY_CAPACITY 10 // K - max osob na trapie
 
-#define DEPARTURE_TIME 15   // T1 - co ile sekund odplywa prom
-#define TRAVEL_TIME 20       // Ti - czas podrozy tam i z powrotem
+#define DEPARTURE_TIME 8   // T1 - co ile sekund odplywa prom
+#define TRAVEL_TIME 10      // Ti - czas podrozy tam i z powrotem
 #define MAX_BAGGAGE 20
 #define DANGEROUS_ITEM_CHANCE 15  // % szans na niebezpieczny przedmiot
 
