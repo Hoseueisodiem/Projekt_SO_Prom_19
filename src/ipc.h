@@ -1,6 +1,7 @@
 #pragma once
 #include <sys/types.h>
 
+// --- Kolejka glowna (key 'P') ---
 #define MSG_TYPE_PASSENGER 1
 #define MSG_TYPE_DECISION_BASE 1000
 #define MSG_TYPE_FERRY_DEPARTED 2000
@@ -27,6 +28,24 @@ struct DecisionMessage {
 struct FerryDepartureMessage {
     long mtype;
     int ferry_id;
-    int passengers_count;  // ilu pasażerów zabrał
+    int passengers_count;  // ilu pasazerow zabral
+};
+
+// Pasazer -> stanowisko mtype = station_id + 1  (1, 2, lub 3)
+// Stanowisko -> pasazer mtype = MSG_TYPE_SECURITY_DONE_BASE + passenger_id
+#define MSG_TYPE_SECURITY_DONE_BASE 10000
+
+struct SecurityJoinMsg {
+    long mtype;        // station_id + 1
+    int passenger_id;
+    int gender;
+    int vip;           // 0 lub 1
+};
+
+struct SecurityDoneMsg {
+    long mtype;        // MSG_TYPE_SECURITY_DONE_BASE + passenger_id
+    int passenger_id;
+    int station_id;
+    int dangerous_item_found;  // 0 lub 1
 };
 

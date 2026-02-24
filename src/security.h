@@ -13,6 +13,7 @@
 #define TRAVEL_TIME 10      // Ti - czas podrozy tam i z powrotem
 #define MAX_BAGGAGE 20
 #define DANGEROUS_ITEM_CHANCE 15  // % szans na niebezpieczny przedmiot
+#define INSPECTION_TIME_MS 300     // czas kontroli na stanowisku (ms)
 
 enum FerryStatus {
     FERRY_AVAILABLE,   // dostepny do zaladowania
@@ -21,17 +22,11 @@ enum FerryStatus {
     FERRY_SHUTDOWN     // zakonczony po sigusr2
 };
 
-struct SecurityStation {
-    int count;   // ile osob przy stanowisku
-    int gender;  // MALE / FEMALE, -1 = brak
-    int total_entered;  // liczba osob ktore weszly na to stanowisko
-    int priority_waiting;  // liczba pasazerow z priorytetem oczekujacych
-};
 // prom pojedyczny
 struct Ferry {
     int onboard;           // ile na promie
     int in_waiting;        // ile w poczekalni
-    int capacity;          // pojemnosc Mp
+    int capacity;          // pojemnosc P
     int baggage_limit;     // limit bagazu w kg
     int in_waiting_vip;    // VIP w poczekalni
     FerryStatus status;    // prom status
@@ -39,9 +34,11 @@ struct Ferry {
     bool signal_sent;      // czy wyslano sigusr1
     bool boarding_allowed; // czy kapitan portu zezwolil na boarding
 };
+
 // stan portu
 struct PortState {
     int accepting_passengers;    // 1 = port otwarty, 0 = zamkniety
     int passengers_onboard;      // liczba pasazerow na wszystkich promach
+    int passengers_in_security;  // pasazerowie aktualnie w kolejce/kontroli bezp.
     Ferry ferries[NUM_FERRIES];  // tablica wszystkich promow
 };

@@ -10,6 +10,7 @@
 #include "passenger.h"
 #include "captain_port.h"
 #include "captain_ferry.h"
+#include "security_station.h"
 #include "security.h"
 
 int main() {
@@ -62,7 +63,20 @@ int main() {
     }
     
     sleep(1);
-    
+
+    // Tworzenie procesow stanowisk kontroli bezpieczenstwa (przed pasazerami)
+    dprintf(STDOUT_FILENO, "[MAIN] Starting %d security stations...\n", NUM_STATIONS);
+    for (int i = 0; i < NUM_STATIONS; i++) {
+        pid = fork();
+        if (pid == 0) {
+            run_security_station(i);
+            _exit(0);
+        }
+        dprintf(STDOUT_FILENO, "[MAIN] Started security station %d with PID=%d\n", i, pid);
+    }
+
+    sleep(1);  // czas na inicjalizacje stanowisk
+
     // Tworzenie procesow pasazerow
     int num_passengers = 1000;
     for (int i = 0; i < num_passengers; i++) {
@@ -73,12 +87,13 @@ int main() {
         }
         usleep(10000); //odstep miedzy pasazerami
     }
-    
+
     // Liczba wszystkich procesów potomnych
-    int total_processes = 1 + NUM_FERRIES + num_passengers;  // port + promy + pasażerowie
+    int total_processes = 1 + NUM_FERRIES + NUM_STATIONS + num_passengers;  // port + promy + stanowiska + pasazerowie
     
-    dprintf(STDOUT_FILENO, "[MAIN] Created %d processes total (1 port + %d ferries + %d passengers)\n", 
-            total_processes, NUM_FERRIES, num_passengers);
+    dprintf(STDOUT_FILENO,
+            "[MAIN] Created %d processes total (1 port + %d ferries + %d stations + %d passengers)\n",
+            total_processes, NUM_FERRIES, NUM_STATIONS, num_passengers);
     dprintf(STDOUT_FILENO, "[MAIN] Waiting 200 seconds before closing port...\n");
     sleep(200);
     

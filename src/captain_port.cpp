@@ -31,23 +31,23 @@ static void handle_sigusr2(int) {
 }
 
 static void cleanup_ipc() {
-    // usun kolejkę komunikatów
+    // usun glowna kolejke komunikatow
     key_t msg_key = ftok("/tmp", 'P');
     if (msg_key != -1) {
         int msgid = msgget(msg_key, 0);
         if (msgid != -1) {
             msgctl(msgid, IPC_RMID, nullptr);
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Removed old message queue\n");
+            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Removed old message queue (P)\n");
         }
     }
-    
-    // usun pamięć stanowisk
-    key_t shm_key = ftok("/tmp", 'M');
-    if (shm_key != -1) {
-        int shmid = shmget(shm_key, 0, 0);
-        if (shmid != -1) {
-            shmctl(shmid, IPC_RMID, nullptr);
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Removed old stations shared memory\n");
+
+    // usun kolejke kontroli bezpieczenstwa
+    key_t sec_key = ftok("/tmp", 'Q');
+    if (sec_key != -1) {
+        int secid = msgget(sec_key, 0);
+        if (secid != -1) {
+            msgctl(secid, IPC_RMID, nullptr);
+            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Removed old security queue (Q)\n");
         }
     }
 
@@ -60,7 +60,7 @@ static void cleanup_ipc() {
             dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Removed old mutex\n");
         }
     }
-    
+
     // usun trap semafora
     key_t trap_key = ftok("/tmp", 'T');
     if (trap_key != -1) {
@@ -168,29 +168,16 @@ void run_captain_port() {
     key_t key = ftok("/tmp", 'P');
     int msgid = msgget(key, IPC_CREAT | 0666);
     if (msgid == -1) {
-        dprintf(STDERR_FILENO, "[CAPTAIN PORT] failed to create message queue\n");
+        dprintf(STDERR_FILENO, "[CAPTAIN PORT] failed to create message queue (P)\n");
         _exit(1);
     }
 
-    // pamiec wspoldzielona stan stanowisk
-    key_t shm_key = ftok("/tmp", 'M');
-    int shmid = shmget(shm_key, sizeof(SecurityStation) * NUM_STATIONS, IPC_CREAT | 0666);
-    if (shmid == -1) {
-        dprintf(STDERR_FILENO, "[CAPTAIN PORT] failed to create shared memory\n");
+    // kolejka kontroli bezpieczenstwa (czytana przez stanowiska, pisana przez pasazerow)
+    key_t sec_key = ftok("/tmp", 'Q');
+    int sec_queue = msgget(sec_key, IPC_CREAT | 0666);
+    if (sec_queue == -1) {
+        dprintf(STDERR_FILENO, "[CAPTAIN PORT] failed to create security queue (Q)\n");
         _exit(1);
-    }
-
-    SecurityStation* stations = (SecurityStation*) shmat(shmid, nullptr, 0);
-    if (stations == (void*) -1) {
-        perror("shmat stations");
-        _exit(1);
-    }
-
-    for (int i = 0; i < NUM_STATIONS; i++) {
-        stations[i].count = 0;
-        stations[i].gender = -1;
-        stations[i].total_entered = 0;
-        stations[i].priority_waiting = 0;
     }
 
     // mutex do ochrony stanu
@@ -222,6 +209,7 @@ void run_captain_port() {
     // inicjalizacja stanu portu i promow
     port_state->accepting_passengers = 1;
     port_state->passengers_onboard = 0;
+    port_state->passengers_in_security = 0;
 
     // inicjalizuj kazdy prom
     for (int i = 0; i < NUM_FERRIES; i++) {
@@ -311,11 +299,14 @@ void run_captain_port() {
                 for (int i = 0; i < NUM_FERRIES; i++) {
                     total_waiting += port_state->ferries[i].in_waiting + port_state->ferries[i].in_waiting_vip;
                 }
+                int in_security = port_state->passengers_in_security;
                 sem_up(mutex, 0);
 
-                if (remaining == 0 && total_waiting == 0) break;
+                if (remaining == 0 && total_waiting == 0 && in_security == 0) break;
 
-                dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Still %d onboard, %d waiting. Waiting...\n", remaining, total_waiting);
+                dprintf(STDOUT_FILENO,
+                    "[CAPTAIN PORT] Still %d onboard, %d waiting, %d in security. Waiting...\n",
+                    remaining, total_waiting, in_security);
                 sleep(1);
             }
 
@@ -474,6 +465,5 @@ void run_captain_port() {
     }
 
     shmdt(port_state);
-    shmdt(stations);
     cleanup_ipc();
 }

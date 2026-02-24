@@ -65,14 +65,12 @@ void run_passenger(int id) {
     int baggage = rand() % 40 + 1; //1-40kg
     int gender  = rand() % 2;      // male/female
     bool vip    = (rand() % 5 == 0); // ok 20% vip
-    bool has_dangerous_item = (rand() % 100 < DANGEROUS_ITEM_CHANCE);
 
     dprintf(STDOUT_FILENO,
-            "[PASSENGER] id=%d %s gender=%s%s\n",
+            "[PASSENGER] id=%d %s gender=%s\n",
             id,
             vip ? "VIP" : "REGULAR",
-            gender == MALE ? "MALE" : "FEMALE",
-            has_dangerous_item ? " [HAS DANGEROUS ITEM]" : "");
+            gender == MALE ? "MALE" : "FEMALE");
 
     PassengerMessage msg;
     msg.mtype = MSG_TYPE_PASSENGER;
@@ -109,134 +107,59 @@ void run_passenger(int id) {
     dprintf(STDOUT_FILENO, "[PASSENGER] id=%d ACCEPTED (assigned to ferry %d)\n",
             id, assigned_ferry_id);
 
-/*=== kontrola bezp ===*/
-    key_t shm_key = ftok("/tmp", 'M');
-    int shmid = shmget(shm_key, sizeof(SecurityStation) * NUM_STATIONS, 0666);
-    SecurityStation* stations = (SecurityStation*) shmat(shmid, nullptr, 0);
-
-    if (stations == (void*) -1) {
-    perror("shmat stations");
-    _exit(1);
-    }
-
-    key_t mutex_key = ftok("/tmp", 'X');
-    int mutex = semget(mutex_key, 1, 0666);
-
+/*=== kontrola bezpieczenstwa (stanowisko aktywnie sprawdza pasazera) ===*/
+    // Wybor stanowiska: kobiety 0, mezczyznic1 lub 2
     int station;
     if (gender == FEMALE) {
         station = 0;
     } else {
-        station = (id % 2 == 0) ? 1 : 2;  // mezczyzni na stanowiska 1 lub 2
+        station = (id % 2 == 0) ? 1 : 2;
     }
 
-    dprintf(STDOUT_FILENO, "[PASSENGER] id=%d WAITING for security station %d\n", id, station);
+    // poinformuj PortState ze pasazer wchodzi do kontroli
+    key_t mutex_key = ftok("/tmp", 'X');
+    int mutex = semget(mutex_key, 1, 0666);
 
-    // inicjalizuj licznik przed petla
     sem_down(mutex, 0);
-    int last_total_entered = stations[station].total_entered;
+    port_state->passengers_in_security++;
     sem_up(mutex, 0);
 
-    int skipped_count = 0;  // ile osob mnie przepuscilo
-    bool has_priority = false;  // czy ma priorytet po 3 przepuszczeniach
-    int security_wait_iter = 0;
-
-    while (true) {
-        security_wait_iter++;
-        sem_down(mutex, 0);
-
-        // Pasazer juz zaakceptowany - kontynuuje kontrole nawet po zamknieciu portu
-        // (spec: "nie moga wejsc na odprawe" = blokuj nowych, nie wyrzucaj juz przyjętych)
-
-        // sprawdz ile osob weszlo od ostatniego sprawdzenia
-        int new_entries = stations[station].total_entered - last_total_entered;
-        if (new_entries > 0 && !has_priority) {
-            skipped_count += new_entries;  // ktos mnie przepuscil
-            last_total_entered = stations[station].total_entered;
-
-            if (!vip && new_entries > 0 && security_wait_iter % 5 == 1) {
-                dprintf(STDOUT_FILENO,
-                "[PASSENGER] id=%d skipped by %d passenger(s), total skipped: %d/3\n",
-                id, new_entries, skipped_count);
-            }
-
-            // po 3 przepuszczeniach dostaje prio
-            if (!vip && skipped_count >= 3 && !has_priority) {
-                has_priority = true;
-                stations[station].priority_waiting++;
-                dprintf(STDOUT_FILENO,
-                        "[PASSENGER] id=%d gained PRIORITY after being skipped %d times (priority queue: %d)\n",
-                        id, skipped_count, stations[station].priority_waiting);
-            }
-        }
-
-        // logika wejscia
-        bool can_enter = false;
-
-        if (has_priority) {
-            if (stations[station].count == 0) {
-                stations[station].gender = gender;
-                can_enter = true;
-            } else if (stations[station].gender == gender && stations[station].count < 2) {
-                can_enter = true;
-            }
-        } else {
-            // normalny pasazer moze wejsc tylko gdy nikt z priorytetem nie czeka
-            if (stations[station].priority_waiting == 0) {
-                if (stations[station].count == 0) {
-                    stations[station].gender = gender;
-                }
-                if (stations[station].gender == gender && stations[station].count < 2) {
-                    can_enter = true;
-                }
-            }
-        }
-
-        if (can_enter) {
-            stations[station].count++;
-            stations[station].total_entered++;
-
-            // jesli mial prio zmniejsz licznik priorytetowych
-            if (has_priority) {
-                stations[station].priority_waiting--;
-            }
-
-            sem_up(mutex, 0);
-
-            dprintf(STDOUT_FILENO, "[PASSENGER] id=%d %sENTER security station %d\n",
-                    id, has_priority ? "(PRIORITY) " : "", station);
-            break;
-        }
-
-        sem_up(mutex, 0);
-        sleep(1);
+    // wyslij zgloszenie do stanowiska kontroli
+    key_t sec_key = ftok("/tmp", 'Q');
+    int sec_queue = msgget(sec_key, 0666);
+    if (sec_queue == -1) {
+        perror("[PASSENGER] msgget sec_queue");
+        _exit(1);
     }
 
-    usleep(100000); // symulacja kontroli (100ms)
-    if (has_dangerous_item) {
-        has_dangerous_item = false;
-        dprintf(STDOUT_FILENO,
-                "[SECURITY] id=%d DANGEROUS ITEM FOUND at station %d! Item confiscated, passenger continues.\n",
-                id, station);
-        usleep(100000); // dodatkowy czas na konfiskate (100ms)
-    } else {
-        dprintf(STDOUT_FILENO,
-                "[SECURITY] id=%d OK at station %d\n",
-                id, station);
-    }
+    SecurityJoinMsg join_msg;
+    join_msg.mtype        = station + 1;  // mtype 1,2 lub 3
+    join_msg.passenger_id = id;
+    join_msg.gender       = gender;
+    join_msg.vip          = vip ? 1 : 0;
+
+    msgsnd(sec_queue, &join_msg, sizeof(SecurityJoinMsg) - sizeof(long), 0);
 
     dprintf(STDOUT_FILENO,
-            "[PASSENGER] id=%d LEAVE security station %d\n",
+            "[PASSENGER] id=%d WAITING for security station %d\n",
             id, station);
 
-    //wyjscie
-    sem_down(mutex, 0);
-    stations[station].count--;
-    if (stations[station].count == 0) {
-        stations[station].gender = -1;
-    }
+    // czekaj az stanowisko zakonczy inspekcje
+    SecurityDoneMsg done_msg;
+    msgrcv(sec_queue, &done_msg,
+           sizeof(SecurityDoneMsg) - sizeof(long),
+           MSG_TYPE_SECURITY_DONE_BASE + id, 0);
 
-    // Pasazer przeszedl kontrole - kontynuuje do poczekalni nawet po zamknieciu portu
-    sem_up(mutex, 0);
+    if (done_msg.dangerous_item_found) {
+        dprintf(STDOUT_FILENO,
+                "[PASSENGER] id=%d Dangerous item confiscated at station %d, "
+                "passenger continues\n",
+                id, station);
+    } else {
+        dprintf(STDOUT_FILENO,
+                "[PASSENGER] id=%d Security check OK at station %d\n",
+                id, station);
+    }
 
     // uzyj przydzielonego promu z PortState
     Ferry* my_ferry = &port_state->ferries[assigned_ferry_id];
@@ -280,7 +203,6 @@ void run_passenger(int id) {
             else my_ferry->in_waiting--;
             sem_up(mutex, 0);
             shmdt(port_state);
-            shmdt(stations);
             return;
         }
         sleep(1);
@@ -321,7 +243,6 @@ void run_passenger(int id) {
             else my_ferry->in_waiting--;
             sem_up(mutex, 0);
             shmdt(port_state);
-            shmdt(stations);
             return;
         }
 
@@ -388,5 +309,4 @@ void run_passenger(int id) {
 
     //cleanup
     shmdt(port_state);
-    shmdt(stations);
 }
