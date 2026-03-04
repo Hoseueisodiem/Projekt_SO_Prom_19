@@ -1,7 +1,6 @@
 #include <unistd.h>
 #include <sys/msg.h>
 #include <sys/ipc.h>
-#include <sys/sem.h>
 #include <sys/shm.h>
 #include <cstdio>
 #include <cstdlib>
@@ -13,16 +12,20 @@
 #include "security_station.h"
 #include "security.h"
 #include "ipc.h"
+#include "log_uring.h"
 
-static void sem_down(int semid, int semnum) {
-    struct sembuf sb = {static_cast<unsigned short>(semnum), -1, 0};
-    semop(semid, &sb, 1);
+// io_uring ring dla async logowania w tym procesie
+static struct io_uring g_ring;
+static bool g_ring_ok = false;
+
+static void LOG(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    if (g_ring_ok) log_uring_printf(&g_ring, STDOUT_FILENO, fmt, ap);
+    else           vdprintf(STDOUT_FILENO, fmt, ap);
+    va_end(ap);
 }
 
-static void sem_up(int semid, int semnum) {
-    struct sembuf sb = {static_cast<unsigned short>(semnum), 1, 0};
-    semop(semid, &sb, 1);
-}
 
 // pasazer czekajacy w kolejce na wejscie do stanowiska
 struct WaitingEntry {
@@ -48,6 +51,7 @@ static long elapsed_ms(struct timespec start, struct timespec end) {
 void run_security_station(int station_id) {
     prctl(PR_SET_NAME, "kontrola_bezp");
     srand(getpid());
+    if (log_uring_init(&g_ring, 32) == 0) g_ring_ok = true;
 
     // dostep do kolejki kontroli (tworzona przez kapitan_port)
     key_t sec_key = ftok("/tmp", 'Q');
@@ -80,26 +84,13 @@ void run_security_station(int station_id) {
         _exit(1);
     }
 
-    // dostep do mutexu
-    key_t mutex_key = ftok("/tmp", 'X');
-    int mutex = -1;
-    for (int attempt = 0; attempt < 50; attempt++) {
-        mutex = semget(mutex_key, 1, 0666);
-        if (mutex != -1) break;
-        usleep(100000);
-    }
-    if (mutex == -1) {
-        perror("[STATION] semget mutex");
-        _exit(1);
-    }
-
     // Stan wewnetrzny stanowiska (zarzadzany wylacznie przez ten proces)
     int current_count = 0;  // ile osob teraz na stanowisku (0-2)
     int current_gender = -1; // plec aktualnie kontrolowanych (-1 = brak)
     std::vector<WaitingEntry>    waiting;         // kolejka oczekujacych
     std::vector<InspectionEntry> being_inspected;  // aktualnie kontrolowani
 
-    dprintf(STDOUT_FILENO, "[STATION %d] PID=%d Ready\n", station_id, getpid());
+    LOG( "[STATION %d] PID=%d Ready\n", station_id, getpid());
 
     // licznik iteracji z pustymi kolejkami po zamknieciu portu
     // czas na doarcie pasazerow ktorzy sa w drodze
@@ -124,22 +115,19 @@ void run_security_station(int station_id) {
                        sizeof(SecurityDoneMsg) - sizeof(long), 0);
 
                 // zaktualizuj licznik w PortState
-                sem_down(mutex, 0);
-                if (port_state->passengers_in_security > 0)
-                    port_state->passengers_in_security--;
-                sem_up(mutex, 0);
+                port_state->passengers_in_security.fetch_sub(1);
 
                 // zaktualizuj stan stanowiska
                 current_count--;
                 if (current_count == 0) current_gender = -1;
 
                 if (entry.dangerous_item) {
-                    dprintf(STDOUT_FILENO,
+                    LOG(
                         "[STATION %d] DANGEROUS ITEM found on passenger %d! "
                         "Item confiscated, passenger continues.\n",
                         station_id, entry.passenger_id);
                 } else {
-                    dprintf(STDOUT_FILENO,
+                    LOG(
                         "[STATION %d] Passenger %d OK, inspection complete\n",
                         station_id, entry.passenger_id);
                 }
@@ -190,7 +178,7 @@ void run_security_station(int station_id) {
                 if (w.gender == current_gender) {
                     w.skip_count++;
                     if (w.skip_count == 3) {
-                        dprintf(STDOUT_FILENO,
+                        LOG(
                             "[STATION %d] Passenger %d: PRIORITY granted after 3 skips\n",
                             station_id, w.passenger_id);
                     }
@@ -204,7 +192,7 @@ void run_security_station(int station_id) {
             insp.dangerous_item = (rand() % 100 < DANGEROUS_ITEM_CHANCE) ? 1 : 0;
             being_inspected.push_back(insp);
 
-            dprintf(STDOUT_FILENO,
+            LOG(
                 "[STATION %d] Passenger %d %sENTER (at station: %d, "
                 "skip=%d, queue: %zu)\n",
                 station_id, admitted.passenger_id,
@@ -224,7 +212,7 @@ void run_security_station(int station_id) {
             w.vip          = join_msg.vip;
             w.skip_count   = 0;
             waiting.push_back(w);
-            dprintf(STDOUT_FILENO,
+            LOG(
                 "[STATION %d] Passenger %d joined queue "
                 "(queue: %zu, inspecting: %zu)\n",
                 station_id, join_msg.passenger_id,
@@ -232,10 +220,10 @@ void run_security_station(int station_id) {
         }
 
         // war zakonczenia
-        sem_down(mutex, 0);
+        spinlock_lock(port_state->spinlock);
         bool port_closed = !port_state->accepting_passengers;
-        int in_sec = port_state->passengers_in_security;
-        sem_up(mutex, 0);
+        spinlock_unlock(port_state->spinlock);
+        int in_sec = port_state->passengers_in_security.load(); // wait-free read
 
         if (port_closed && waiting.empty() && being_inspected.empty()) {
             // jesli passengers_in_security == 0, wszystkie stanowiska skonczone
@@ -243,7 +231,7 @@ void run_security_station(int station_id) {
                 idle_after_close++;
                 // Kilka dodatkowych iteracji na wypadek pasazerow w drodze
                 if (idle_after_close >= 20) {
-                    dprintf(STDOUT_FILENO,
+                    LOG(
                         "[STATION %d] Port closed, queue empty. Shutting down.\n",
                         station_id);
                     break;
@@ -259,5 +247,6 @@ void run_security_station(int station_id) {
     }
 
     shmdt(port_state);
-    dprintf(STDOUT_FILENO, "[STATION %d] Shutdown complete\n", station_id);
+    LOG( "[STATION %d] Shutdown complete\n", station_id);
+    if (g_ring_ok) { log_uring_flush(&g_ring); log_uring_destroy(&g_ring); }
 }

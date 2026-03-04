@@ -11,12 +11,18 @@
 #include "passenger.h"
 #include "ipc.h"
 #include "security.h"
+#include "log_uring.h"
 
-//semafory
-static void sem_down(int semid, int semnum) {
-    struct sembuf sb = {
-        static_cast<unsigned short>(semnum), -1, 0};
-    semop(semid, &sb, 1);
+// io_uring ring dla async logowania
+static struct io_uring g_ring;
+static bool g_ring_ok = false;
+
+static void LOG(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    if (g_ring_ok) log_uring_printf(&g_ring, STDOUT_FILENO, fmt, ap);
+    else           vdprintf(STDOUT_FILENO, fmt, ap);
+    va_end(ap);
 }
 
 static void sem_up(int semid, int semnum) {
@@ -27,6 +33,7 @@ static void sem_up(int semid, int semnum) {
 
 void run_passenger(int id) {
     prctl(PR_SET_NAME, "pasazer");
+    if (log_uring_init(&g_ring, 16) == 0) g_ring_ok = true;
 
     // czy port przyjmuje pasazerow
     key_t port_state_key = ftok("/tmp", 'S');
@@ -52,8 +59,9 @@ void run_passenger(int id) {
     
     // spradzanie czy port przyjmuje pasazerow
     if (!port_state->accepting_passengers) {
-        dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Port CLOSED, cannot enter\n", id);
+        LOG( "[PASSENGER] id=%d Port CLOSED, cannot enter\n", id);
         shmdt(port_state);
+        if (g_ring_ok) { log_uring_flush(&g_ring); log_uring_destroy(&g_ring); }
         return;  // pasazer odchodzi
     }
 
@@ -66,7 +74,7 @@ void run_passenger(int id) {
     int gender  = rand() % 2;      // male/female
     bool vip    = (rand() % 5 == 0); // ok 20% vip
 
-    dprintf(STDOUT_FILENO,
+    LOG(
             "[PASSENGER] id=%d %s gender=%s\n",
             id,
             vip ? "VIP" : "REGULAR",
@@ -80,7 +88,7 @@ void run_passenger(int id) {
 
     msgsnd(msgid, &msg, sizeof(PassengerMessage) - sizeof(long), 0);
 
-    dprintf(STDOUT_FILENO,
+    LOG(
             "[PASSENGER] id=%d baggage=%d kg sent for check\n",
             id, baggage);
 
@@ -93,18 +101,19 @@ void run_passenger(int id) {
 
     if (!decision.accepted) {
         if (decision.reject_reason == REJECT_PORT_CLOSED) {
-            dprintf(STDOUT_FILENO, "[PASSENGER] id=%d REJECTED (port closed)\n", id);
+            LOG( "[PASSENGER] id=%d REJECTED (port closed)\n", id);
         } else {
-            dprintf(STDOUT_FILENO, "[PASSENGER] id=%d REJECTED (baggage too heavy)\n", id);
+            LOG( "[PASSENGER] id=%d REJECTED (baggage too heavy)\n", id);
         }
-        shmdt(port_state); //cleanup
+        shmdt(port_state);
+        if (g_ring_ok) { log_uring_flush(&g_ring); log_uring_destroy(&g_ring); }
         return;
     }
 
     // zapamietaj ID przydzielonego promu
     int assigned_ferry_id = decision.ferry_id;
 
-    dprintf(STDOUT_FILENO, "[PASSENGER] id=%d ACCEPTED (assigned to ferry %d)\n",
+    LOG( "[PASSENGER] id=%d ACCEPTED (assigned to ferry %d)\n",
             id, assigned_ferry_id);
 
 /*=== kontrola bezpieczenstwa (stanowisko aktywnie sprawdza pasazera) ===*/
@@ -117,12 +126,7 @@ void run_passenger(int id) {
     }
 
     // poinformuj PortState ze pasazer wchodzi do kontroli
-    key_t mutex_key = ftok("/tmp", 'X');
-    int mutex = semget(mutex_key, 1, 0666);
-
-    sem_down(mutex, 0);
-    port_state->passengers_in_security++;
-    sem_up(mutex, 0);
+    port_state->passengers_in_security.fetch_add(1);
 
     // wyslij zgloszenie do stanowiska kontroli
     key_t sec_key = ftok("/tmp", 'Q');
@@ -140,7 +144,7 @@ void run_passenger(int id) {
 
     msgsnd(sec_queue, &join_msg, sizeof(SecurityJoinMsg) - sizeof(long), 0);
 
-    dprintf(STDOUT_FILENO,
+    LOG(
             "[PASSENGER] id=%d WAITING for security station %d\n",
             id, station);
 
@@ -151,12 +155,12 @@ void run_passenger(int id) {
            MSG_TYPE_SECURITY_DONE_BASE + id, 0);
 
     if (done_msg.dangerous_item_found) {
-        dprintf(STDOUT_FILENO,
+        LOG(
                 "[PASSENGER] id=%d Dangerous item confiscated at station %d, "
                 "passenger continues\n",
                 id, station);
     } else {
-        dprintf(STDOUT_FILENO,
+        LOG(
                 "[PASSENGER] id=%d Security check OK at station %d\n",
                 id, station);
     }
@@ -164,45 +168,45 @@ void run_passenger(int id) {
     // uzyj przydzielonego promu z PortState
     Ferry* my_ferry = &port_state->ferries[assigned_ferry_id];
 
-    sem_down(mutex, 0);
+    spinlock_lock(port_state->spinlock);
     if (vip) {
         my_ferry->in_waiting_vip++;
         int vip_waiting = my_ferry->in_waiting_vip;
-        sem_up(mutex, 0);
-        dprintf(STDOUT_FILENO,
+        spinlock_unlock(port_state->spinlock);
+        LOG(
                 "[PASSENGER] id=%d (VIP) ENTERED waiting area for ferry %d (%d VIP waiting)\n",
                 id, assigned_ferry_id, vip_waiting);
     } else {
         my_ferry->in_waiting++;
         int reg_waiting = my_ferry->in_waiting;
-        sem_up(mutex, 0);
-        dprintf(STDOUT_FILENO,
+        spinlock_unlock(port_state->spinlock);
+        LOG(
                 "[PASSENGER] id=%d ENTERED waiting area for ferry %d (%d regular waiting)\n",
                 id, assigned_ferry_id, reg_waiting);
     }
 
 /*=== czekanie na ogloszenie boardingu przez kapitana portu ===*/
     while (true) {
-        sem_down(mutex, 0);
+        spinlock_lock(port_state->spinlock);
         bool boarding_open = my_ferry->boarding_allowed;
-        bool port_open = port_state->accepting_passengers;
         FerryStatus fstatus = my_ferry->status;
-        sem_up(mutex, 0);
+        spinlock_unlock(port_state->spinlock);
 
         if (boarding_open) {
-            dprintf(STDOUT_FILENO,
+            LOG(
                     "[PASSENGER] id=%d Boarding announced for ferry %d, proceeding to gangway\n",
                     id, assigned_ferry_id);
             break;
         }
         if (fstatus == FERRY_SHUTDOWN) {
-            dprintf(STDOUT_FILENO,
+            LOG(
                     "[PASSENGER] id=%d Ferry shutdown while waiting for boarding, leaving\n", id);
-            sem_down(mutex, 0);
+            spinlock_lock(port_state->spinlock);
             if (vip) my_ferry->in_waiting_vip--;
             else my_ferry->in_waiting--;
-            sem_up(mutex, 0);
+            spinlock_unlock(port_state->spinlock);
             shmdt(port_state);
+            if (g_ring_ok) { log_uring_flush(&g_ring); log_uring_destroy(&g_ring); }
             return;
         }
         sleep(1);
@@ -216,12 +220,11 @@ void run_passenger(int id) {
     int boarding_wait_iter = 0;
     while (true) {
         boarding_wait_iter++;
-        sem_down(mutex, 0);
+        spinlock_lock(port_state->spinlock);
         bool ferry_has_space = (my_ferry->onboard < my_ferry->capacity);
         int current_onboard = my_ferry->onboard;
         int vip_count = my_ferry->in_waiting_vip;
         FerryStatus bstatus = my_ferry->status;
-        bool bport_open = port_state->accepting_passengers;
 
         bool can_enter = false;
         int free_spots = my_ferry->capacity - current_onboard;
@@ -231,28 +234,29 @@ void run_passenger(int id) {
             // regularny moze wejsc gdy: brak VIP-ow LUB jest wiecej miejsc niz VIP-ow
             can_enter = ferry_has_space && (vip_count == 0 || free_spots > vip_count);
         }
-        sem_up(mutex, 0);
+        spinlock_unlock(port_state->spinlock);
 
         // wyjscie tylko gdy prom shutdown (jesli odplynal - czekaj na powrot)
         if (bstatus == FERRY_SHUTDOWN) {
-            dprintf(STDOUT_FILENO,
+            LOG(
                     "[PASSENGER] id=%d Ferry %d shutdown, leaving\n",
                     id, assigned_ferry_id);
-            sem_down(mutex, 0);
+            spinlock_lock(port_state->spinlock);
             if (vip) my_ferry->in_waiting_vip--;
             else my_ferry->in_waiting--;
-            sem_up(mutex, 0);
+            spinlock_unlock(port_state->spinlock);
             shmdt(port_state);
+            if (g_ring_ok) { log_uring_flush(&g_ring); log_uring_destroy(&g_ring); }
             return;
         }
 
         if (!can_enter) {
             if (boarding_wait_iter % 5 == 1) {
                 if (!ferry_has_space) {
-                    dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Waiting, ferry %d full (%d/%d)\n",
+                    LOG( "[PASSENGER] id=%d Waiting, ferry %d full (%d/%d)\n",
                         id, assigned_ferry_id, current_onboard, my_ferry->capacity);
                 } else {
-                    dprintf(STDOUT_FILENO, "[PASSENGER] id=%d Waiting for %d VIP passengers to board first\n",
+                    LOG( "[PASSENGER] id=%d Waiting for %d VIP passengers to board first\n",
                         id, vip_count);
                 }
             }
@@ -265,7 +269,7 @@ void run_passenger(int id) {
         struct sembuf sb = {static_cast<unsigned short>(assigned_ferry_id), -1, IPC_NOWAIT};
         if (semop(trap_sem, &sb, 1) != -1) {
             // zdobyty trap, ale sprawdz jeszcze raz pojemnosc
-            sem_down(mutex, 0);
+            spinlock_lock(port_state->spinlock);
             
             // triple-check pojemnosci
             if (my_ferry->onboard < my_ferry->capacity) {
@@ -274,17 +278,17 @@ void run_passenger(int id) {
                 else my_ferry->in_waiting--;
 
                 my_ferry->onboard++;
-                port_state->passengers_onboard++;
+                port_state->passengers_onboard.fetch_add(1); // wait-free
 
                 int final_onboard = my_ferry->onboard;
                 int final_waiting = my_ferry->in_waiting;
                 int final_vip_waiting = my_ferry->in_waiting_vip;
-                int total_onboard = port_state->passengers_onboard;
+                int total_onboard = port_state->passengers_onboard.load(); // wait-free read
 
-                sem_up(mutex, 0);
+                spinlock_unlock(port_state->spinlock);
                 sem_up(trap_sem, assigned_ferry_id);
 
-                dprintf(STDOUT_FILENO,
+                LOG(
                         "[PASSENGER] id=%d %sBOARDED ferry %d (%d reg, %d VIP waiting, %d/%d onboard, %d total)\n",
                         id, vip ? "(VIP) " : "", assigned_ferry_id,
                         final_waiting, final_vip_waiting,
@@ -294,9 +298,9 @@ void run_passenger(int id) {
                 break;
             } else {
                 // prom zapelnil sie w miedzyczasie
-                sem_up(mutex, 0);
+                spinlock_unlock(port_state->spinlock);
                 sem_up(trap_sem, assigned_ferry_id);
-                dprintf(STDOUT_FILENO,
+                LOG(
                         "[PASSENGER] id=%d Ferry became full while on gangway\n", id);
                 sleep(1);
                 continue;
@@ -307,6 +311,6 @@ void run_passenger(int id) {
         sleep(1);
     }
 
-    //cleanup
     shmdt(port_state);
+    if (g_ring_ok) { log_uring_flush(&g_ring); log_uring_destroy(&g_ring); }
 }

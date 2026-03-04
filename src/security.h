@@ -1,5 +1,19 @@
 #pragma once
 #include <sys/types.h>
+#include <atomic>
+
+static_assert(std::atomic<int>::is_always_lock_free, "Need lock-free atomics for spinlock");
+
+inline void spinlock_lock(std::atomic<int>& lk) {
+    int expected = 0;
+    while (!lk.compare_exchange_weak(expected, 1,
+           std::memory_order_acquire, std::memory_order_relaxed))
+        expected = 0;  // reset
+}
+
+inline void spinlock_unlock(std::atomic<int>& lk) {
+    lk.store(0, std::memory_order_release);
+}
 
 #define NUM_STATIONS 3
 #define MALE   0
@@ -37,8 +51,9 @@ struct Ferry {
 
 // stan portu
 struct PortState {
-    int accepting_passengers;    // 1 = port otwarty, 0 = zamkniety
-    int passengers_onboard;      // liczba pasazerow na wszystkich promach
-    int passengers_in_security;  // pasazerowie aktualnie w kolejce/kontroli bezp.
-    Ferry ferries[NUM_FERRIES];  // tablica wszystkich promow
+    int accepting_passengers;                    // 1 = port otwarty, 0 = zamkniety
+    std::atomic<int> passengers_onboard{0};      // wait-free: fetch_add/fetch_sub
+    std::atomic<int> passengers_in_security{0};  // wait-free: fetch_add/fetch_sub
+    std::atomic<int> spinlock{0};                // CAS spinlock: zastępuje semafor 'X'
+    Ferry ferries[NUM_FERRIES];                  // tablica wszystkich promow
 };

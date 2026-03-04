@@ -11,18 +11,20 @@
 #include "captain_port.h"
 #include "ipc.h"
 #include "security.h"
+#include "log_uring.h"
 
-static void sem_down(int semid, int semnum) {
-    struct sembuf sb = {
-        static_cast<unsigned short>(semnum), -1, 0};
-    semop(semid, &sb, 1);
+// io_uring ring dla async logowania
+static struct io_uring g_ring;
+static bool g_ring_ok = false;
+
+static void LOG(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    if (g_ring_ok) log_uring_printf(&g_ring, STDOUT_FILENO, fmt, ap);
+    else           vdprintf(STDOUT_FILENO, fmt, ap);
+    va_end(ap);
 }
 
-static void sem_up(int semid, int semnum) {
-    struct sembuf sb = {
-        static_cast<unsigned short>(semnum), 1, 0};
-    semop(semid, &sb, 1);
-}
 
 volatile sig_atomic_t port_closed = 0;
 
@@ -37,7 +39,7 @@ static void cleanup_ipc() {
         int msgid = msgget(msg_key, 0);
         if (msgid != -1) {
             msgctl(msgid, IPC_RMID, nullptr);
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Removed old message queue (P)\n");
+            LOG( "[CAPTAIN PORT] Removed old message queue (P)\n");
         }
     }
 
@@ -47,7 +49,7 @@ static void cleanup_ipc() {
         int secid = msgget(sec_key, 0);
         if (secid != -1) {
             msgctl(secid, IPC_RMID, nullptr);
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Removed old security queue (Q)\n");
+            LOG( "[CAPTAIN PORT] Removed old security queue (Q)\n");
         }
     }
 
@@ -57,7 +59,7 @@ static void cleanup_ipc() {
         int semid = semget(mutex_key, 0, 0);
         if (semid != -1) {
             semctl(semid, 0, IPC_RMID);
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Removed old mutex\n");
+            LOG( "[CAPTAIN PORT] Removed old mutex\n");
         }
     }
 
@@ -67,7 +69,7 @@ static void cleanup_ipc() {
         int semid = semget(trap_key, 0, 0);
         if (semid != -1) {
             semctl(semid, 0, IPC_RMID);
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Removed old trap semaphore\n");
+            LOG( "[CAPTAIN PORT] Removed old trap semaphore\n");
         }
     }
 
@@ -77,14 +79,14 @@ static void cleanup_ipc() {
         int shmid = shmget(port_state_key, 0, 0);
         if (shmid != -1) {
             shmctl(shmid, IPC_RMID, nullptr);
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Removed old port state shared memory\n");
+            LOG( "[CAPTAIN PORT] Removed old port state shared memory\n");
         }
     }
 }
 
 // przydzielenie pasazera do promu
-int assign_passenger_to_ferry(PortState* port_state, int mutex, int baggage_weight) {
-    sem_down(mutex, 0);
+int assign_passenger_to_ferry(PortState* port_state, int baggage_weight) {
+    spinlock_lock(port_state->spinlock);
 
     int selected_ferry = -1;
     int min_queue = INT_MAX;  // najmniejsza kolejka
@@ -117,24 +119,24 @@ int assign_passenger_to_ferry(PortState* port_state, int mutex, int baggage_weig
         port_state->ferries[selected_ferry].status = FERRY_BOARDING;
         if (!port_state->ferries[selected_ferry].boarding_allowed) {
             port_state->ferries[selected_ferry].boarding_allowed = true;
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Ferry %d BOARDING OPEN\n", selected_ferry);
+            LOG( "[CAPTAIN PORT] Ferry %d BOARDING OPEN\n", selected_ferry);
         }
     }
 
-    sem_up(mutex, 0);
+    spinlock_unlock(port_state->spinlock);
     return selected_ferry;
 }
 
 // kolejka oczekujacych pasazerow (gdy wszystkie promy pelne/w podrozy)
 static void process_waiting_queue(std::vector<PassengerMessage>& waiting_queue,
-                                   PortState* port_state, int mutex, int msgid) {
+                                   PortState* port_state, int msgid) {
     if (waiting_queue.empty()) return;
 
     // probuj przydzielic pasazerow z kolejki do promow
     std::vector<PassengerMessage> still_waiting;
 
     for (auto& pmsg : waiting_queue) {
-        int ferry_id = assign_passenger_to_ferry(port_state, mutex, pmsg.baggage_weight);
+        int ferry_id = assign_passenger_to_ferry(port_state, pmsg.baggage_weight);
 
         if (ferry_id != -1) {
             DecisionMessage decision;
@@ -143,7 +145,7 @@ static void process_waiting_queue(std::vector<PassengerMessage>& waiting_queue,
             decision.accepted = 1;
             decision.ferry_id = ferry_id;
 
-            dprintf(STDOUT_FILENO,
+            LOG(
                     "[CAPTAIN PORT] Passenger id=%d FROM QUEUE assigned to ferry %d (current: %d waiting, %d onboard, capacity: %d)\n",
                     pmsg.passenger_id, ferry_id,
                     port_state->ferries[ferry_id].in_waiting,
@@ -163,6 +165,7 @@ static void process_waiting_queue(std::vector<PassengerMessage>& waiting_queue,
 void run_captain_port() {
     prctl(PR_SET_NAME, "kapitan_port");
     signal(SIGUSR2, handle_sigusr2);
+    if (log_uring_init(&g_ring, 64) == 0) g_ring_ok = true;
     cleanup_ipc();
 
     key_t key = ftok("/tmp", 'P');
@@ -179,11 +182,6 @@ void run_captain_port() {
         dprintf(STDERR_FILENO, "[CAPTAIN PORT] failed to create security queue (Q)\n");
         _exit(1);
     }
-
-    // mutex do ochrony stanu
-    key_t mutex_key = ftok("/tmp", 'X');
-    int mutex = semget(mutex_key, 1, IPC_CREAT | 0666);
-    semctl(mutex, 0, SETVAL, 1);
 
     // trap K
     key_t trap_key = ftok("/tmp", 'T');
@@ -208,8 +206,9 @@ void run_captain_port() {
 
     // inicjalizacja stanu portu i promow
     port_state->accepting_passengers = 1;
-    port_state->passengers_onboard = 0;
-    port_state->passengers_in_security = 0;
+    port_state->passengers_onboard.store(0);      // atomik
+    port_state->passengers_in_security.store(0);  // atomik
+    port_state->spinlock.store(0);                // CAS spinlock
 
     // inicjalizuj kazdy prom
     for (int i = 0; i < NUM_FERRIES; i++) {
@@ -228,13 +227,13 @@ void run_captain_port() {
     port_state->ferries[1].baggage_limit = 20;  // Prom 1: xkg
     port_state->ferries[2].baggage_limit = 30;  // Prom 2: xkg
 
-    dprintf(STDOUT_FILENO, "[CAPTAIN PORT] PID=%d waiting for passengers...\n", getpid());
-    dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Initialized %d ferries:\n", NUM_FERRIES);
-    dprintf(STDOUT_FILENO, "  - Ferry 0: capacity=%d, baggage_limit=%dkg\n", 
+    LOG( "[CAPTAIN PORT] PID=%d waiting for passengers...\n", getpid());
+    LOG( "[CAPTAIN PORT] Initialized %d ferries:\n", NUM_FERRIES);
+    LOG( "  - Ferry 0: capacity=%d, baggage_limit=%dkg\n", 
         FERRY_CAPACITY, port_state->ferries[0].baggage_limit);
-    dprintf(STDOUT_FILENO, "  - Ferry 1: capacity=%d, baggage_limit=%dkg\n", 
+    LOG( "  - Ferry 1: capacity=%d, baggage_limit=%dkg\n", 
         FERRY_CAPACITY, port_state->ferries[1].baggage_limit);
-    dprintf(STDOUT_FILENO, "  - Ferry 2: capacity=%d, baggage_limit=%dkg\n", 
+    LOG( "  - Ferry 2: capacity=%d, baggage_limit=%dkg\n", 
         FERRY_CAPACITY, port_state->ferries[2].baggage_limit);
 
     int accepted_count = 0;
@@ -244,10 +243,10 @@ void run_captain_port() {
         // sprawdzanie czy port zamkniety
         if (port_closed) {
             port_state->accepting_passengers = 0;
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] SIGUSR2 received - Port CLOSED. No more passengers allowed.\n");
+            LOG( "[CAPTAIN PORT] SIGUSR2 received - Port CLOSED. No more passengers allowed.\n");
 
             // przetworz reszte kolejki - przydziel kogo sie da, reszta odrzucona
-            process_waiting_queue(waiting_queue, port_state, mutex, msgid);
+            process_waiting_queue(waiting_queue, port_state, msgid);
 
             // odrzuc pozostalych w kolejce
             for (auto& pmsg : waiting_queue) {
@@ -258,59 +257,59 @@ void run_captain_port() {
                 decision.ferry_id = -1;
                 decision.reject_reason = REJECT_PORT_CLOSED;
                 msgsnd(msgid, &decision, sizeof(DecisionMessage) - sizeof(long), 0);
-                dprintf(STDOUT_FILENO,
+                LOG(
                         "[CAPTAIN PORT] Passenger id=%d REJECTED from queue (port closing)\n",
                         pmsg.passenger_id);
             }
             waiting_queue.clear();
 
             // otworz boarding dla wszystkich promow z czekajacymi pasazerami
-            sem_down(mutex, 0);
+            spinlock_lock(port_state->spinlock);
             for (int i = 0; i < NUM_FERRIES; i++) {
                 int waiting = port_state->ferries[i].in_waiting + port_state->ferries[i].in_waiting_vip;
                 if (waiting > 0 && !port_state->ferries[i].boarding_allowed) {
                     port_state->ferries[i].boarding_allowed = true;
                     port_state->ferries[i].status = FERRY_BOARDING;
-                    dprintf(STDOUT_FILENO,
+                    LOG(
                         "[CAPTAIN PORT] Ferry %d BOARDING OPEN (port closing, %d passengers still waiting)\n",
                         i, waiting);
                 }
             }
-            sem_up(mutex, 0);
+            spinlock_unlock(port_state->spinlock);
 
             // czekanie az wszyscy pasazerowie zostana przewiezieni (onboard + waiting)
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Waiting for all passengers to be delivered...\n");
+            LOG( "[CAPTAIN PORT] Waiting for all passengers to be delivered...\n");
             while (true) {
                 // otworz boarding dla promow z nowymi pasazerami (moga dojsc z kontroli)
-                sem_down(mutex, 0);
+                spinlock_lock(port_state->spinlock);
                 for (int i = 0; i < NUM_FERRIES; i++) {
                     int waiting = port_state->ferries[i].in_waiting + port_state->ferries[i].in_waiting_vip;
                     if (waiting > 0 && !port_state->ferries[i].boarding_allowed &&
                         port_state->ferries[i].status != FERRY_TRAVELING) {
                         port_state->ferries[i].boarding_allowed = true;
                         port_state->ferries[i].status = FERRY_BOARDING;
-                        dprintf(STDOUT_FILENO,
+                        LOG(
                             "[CAPTAIN PORT] Ferry %d BOARDING OPEN (closing, %d new passengers arrived)\n",
                             i, waiting);
                     }
                 }
-                int remaining = port_state->passengers_onboard;
+                int remaining = port_state->passengers_onboard.load();    // wait-free read
                 int total_waiting = 0;
                 for (int i = 0; i < NUM_FERRIES; i++) {
                     total_waiting += port_state->ferries[i].in_waiting + port_state->ferries[i].in_waiting_vip;
                 }
-                int in_security = port_state->passengers_in_security;
-                sem_up(mutex, 0);
+                int in_security = port_state->passengers_in_security.load(); // wait-free read
+                spinlock_unlock(port_state->spinlock);
 
                 if (remaining == 0 && total_waiting == 0 && in_security == 0) break;
 
-                dprintf(STDOUT_FILENO,
+                LOG(
                     "[CAPTAIN PORT] Still %d onboard, %d waiting, %d in security. Waiting...\n",
                     remaining, total_waiting, in_security);
                 sleep(1);
             }
 
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] All passengers delivered. Shutting down.\n");
+            LOG( "[CAPTAIN PORT] All passengers delivered. Shutting down.\n");
             break;
         }
 
@@ -322,7 +321,7 @@ void run_captain_port() {
                                      IPC_NOWAIT);
 
         if (msg_result != -1) {
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Passenger id=%d baggage=%d kg\n",
+            LOG( "[CAPTAIN PORT] Passenger id=%d baggage=%d kg\n",
                     msg.passenger_id, msg.baggage_weight);
 
             DecisionMessage decision;
@@ -330,7 +329,7 @@ void run_captain_port() {
             decision.passenger_id = msg.passenger_id;
 
             // przydziel pasazera do promu
-            int ferry_id = assign_passenger_to_ferry(port_state, mutex, msg.baggage_weight);
+            int ferry_id = assign_passenger_to_ferry(port_state, msg.baggage_weight);
 
             if (ferry_id == -1) {
                 // sprawdz przyczyne odrzucenia
@@ -347,14 +346,14 @@ void run_captain_port() {
                     decision.accepted = 0;
                     decision.ferry_id = -1;
                     decision.reject_reason = REJECT_BAGGAGE;
-                    dprintf(STDOUT_FILENO,
+                    LOG(
                             "[CAPTAIN PORT] Passenger id=%d REJECTED (baggage %dkg exceeds all ferry limits: max 30kg)\n",
                             msg.passenger_id, msg.baggage_weight);
                     msgsnd(msgid, &decision, sizeof(DecisionMessage) - sizeof(long), 0);
                 } else {
                     // promy pelne/w podrozy - dodaj do kolejki, NIE wysylaj decision
                     waiting_queue.push_back(msg);
-                    dprintf(STDOUT_FILENO,
+                    LOG(
                             "[CAPTAIN PORT] Passenger id=%d QUEUED (all suitable ferries full or traveling, queue size: %zu)\n",
                             msg.passenger_id, waiting_queue.size());
                 }
@@ -365,7 +364,7 @@ void run_captain_port() {
                 decision.ferry_id = ferry_id;
                 accepted_count++;
 
-                dprintf(STDOUT_FILENO,
+                LOG(
                         "[CAPTAIN PORT] Passenger id=%d ACCEPTED, assigned to ferry %d (current: %d waiting, %d onboard, capacity: %d)\n",
                         msg.passenger_id, ferry_id,
                         port_state->ferries[ferry_id].in_waiting,
@@ -383,24 +382,24 @@ void run_captain_port() {
                    sizeof(FerryDepartureMessage) - sizeof(long),
                    MSG_TYPE_FERRY_DEPARTED, IPC_NOWAIT) != -1) {
 
-            dprintf(STDOUT_FILENO,
+            LOG(
                 "[CAPTAIN PORT] Ferry %d departed with %d passengers. Ready for next ferry.\n",
                 departure_msg.ferry_id, departure_msg.passengers_count);
 
             // reset flagi sygnalu dla tego promu
-            sem_down(mutex, 0);
+            spinlock_lock(port_state->spinlock);
             port_state->ferries[departure_msg.ferry_id].signal_sent = false;
             port_state->ferries[departure_msg.ferry_id].boarding_allowed = false;
-            sem_up(mutex, 0);
+            spinlock_unlock(port_state->spinlock);
 
             // prom odplynal - przetworz kolejke oczekujacych (promy wrocily = wolne miejsca)
-            process_waiting_queue(waiting_queue, port_state, mutex, msgid);
+            process_waiting_queue(waiting_queue, port_state, msgid);
 
             continue;
         }
 
         // SIGUSR1 dla kazdego promu osobno
-        sem_down(mutex, 0);
+        spinlock_lock(port_state->spinlock);
         for (int i = 0; i < NUM_FERRIES; i++) {
             Ferry* ferry = &port_state->ferries[i];
 
@@ -415,36 +414,36 @@ void run_captain_port() {
 
             // SIGUSR1 gdy >=50% zapelnienia
             if (total_ready >= ferry->capacity / 2 && ferry->captain_pid > 0) {
-                sem_up(mutex, 0);  // zwolnienie mutexy przed killem
+                spinlock_unlock(port_state->spinlock);  // zwolnienie spinlocka przed killem
 
-                dprintf(STDOUT_FILENO,
+                LOG(
                     "[CAPTAIN PORT] Ferry %d half capacity (%d reg + %d VIP + %d onboard = %d/%d), sending EARLY DEPARTURE to PID=%d\n",
                     i, ferry->in_waiting, ferry->in_waiting_vip, ferry->onboard, total_ready, ferry->capacity, ferry->captain_pid);
 
                 if (kill(ferry->captain_pid, SIGUSR1) == -1) {
                     perror("[CAPTAIN PORT] kill SIGUSR1 failed");
                 } else {
-                    dprintf(STDOUT_FILENO, "[CAPTAIN PORT] SIGUSR1 sent successfully to ferry %d\n", i);
+                    LOG( "[CAPTAIN PORT] SIGUSR1 sent successfully to ferry %d\n", i);
 
-                    sem_down(mutex, 0);
+                    spinlock_lock(port_state->spinlock);
                     ferry->signal_sent = true;
-                    sem_up(mutex, 0);
+                    spinlock_unlock(port_state->spinlock);
                 }
 
-                sem_down(mutex, 0);  // przywrocenie mutexy do petli
+                spinlock_lock(port_state->spinlock);  // przywrocenie spinlocka do petli
             }
         }
-        sem_up(mutex, 0);
+        spinlock_unlock(port_state->spinlock);
 
         // periodycznie przetworz kolejke oczekujacych
-        process_waiting_queue(waiting_queue, port_state, mutex, msgid);
+        process_waiting_queue(waiting_queue, port_state, msgid);
 
         usleep(100000);
     }
-    dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Waiting for all ferries to shut down...\n");
+    LOG( "[CAPTAIN PORT] Waiting for all ferries to shut down...\n");
     int wait_count = 0;
     while (true) {
-        sem_down(mutex, 0);
+        spinlock_lock(port_state->spinlock);
         bool all_shutdown = true;
         for (int j = 0; j < NUM_FERRIES; j++) {
             if (port_state->ferries[j].status != FERRY_SHUTDOWN) {
@@ -452,18 +451,19 @@ void run_captain_port() {
                 break;
             }
         }
-        sem_up(mutex, 0);
+        spinlock_unlock(port_state->spinlock);
 
         if (all_shutdown) {
-            dprintf(STDOUT_FILENO, "[CAPTAIN PORT] All ferries shut down.\n");
+            LOG( "[CAPTAIN PORT] All ferries shut down.\n");
             break;
         }
 
         wait_count++;
-        dprintf(STDOUT_FILENO, "[CAPTAIN PORT] Waiting for ferries to shut down (%d)...\n", wait_count);
+        LOG( "[CAPTAIN PORT] Waiting for ferries to shut down (%d)...\n", wait_count);
         sleep(1);
     }
 
     shmdt(port_state);
     cleanup_ipc();
+    if (g_ring_ok) { log_uring_flush(&g_ring); log_uring_destroy(&g_ring); }
 }
